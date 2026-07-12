@@ -15,9 +15,9 @@ Describe 'Test-ShrinkParameterSet' {
         $e | Should -Not -BeNullOrEmpty
         ($e -join ';') | Should -Match 'mutually exclusive'
     }
-    It 'rejects TruncateOnly + FileTargetSizeGB' {
-        $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=5; AbortAfterWait='SELF'; TruncateOnly=$true; FileTargetSizeGB=100 }
-        ($e -join ';') | Should -Match 'FileTargetSizeGB'
+    It 'rejects TruncateOnly + FileTargetSizeGiB' {
+        $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=5; AbortAfterWait='SELF'; TruncateOnly=$true; FileTargetSizeGiB=100 }
+        ($e -join ';') | Should -Match 'FileTargetSizeGiB'
     }
     It 'rejects Sessions < 1' {
         $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=0; AbortAfterWait='SELF' }
@@ -67,18 +67,46 @@ Describe 'Get-ShrinkBackoffSeconds' {
     }
 }
 
+Describe 'Format-ShrinkKeyValueTable' {
+    It 'pads labels to the widest key and keeps the colon aligned' {
+        $lines = Format-ShrinkKeyValueTable -Rows ([ordered]@{ 'A' = 1; 'Longer' = 2 })
+        $lines.Count | Should -Be 2
+        $lines[1] | Should -Be '  Longer : 2'
+        $lines[0] | Should -Match '^\s{2}A\s+: 1$'
+        $lines[0].IndexOf(':') | Should -Be ($lines[1].IndexOf(':'))
+    }
+}
+
+Describe 'Test-ShrinkWorthwhile' {
+    It 'is worthwhile when reclaimable meets the minimum' {
+        Test-ShrinkWorthwhile -AllocatedMB 1000 -UsedMB 100 -MinReclaimMB 100 | Should -BeTrue
+    }
+    It 'is not worthwhile when reclaimable is below the minimum' {
+        Test-ShrinkWorthwhile -AllocatedMB 1000 -UsedMB 950 -MinReclaimMB 100 | Should -BeFalse
+    }
+    It 'treats exactly the minimum as worthwhile' {
+        Test-ShrinkWorthwhile -AllocatedMB 1000 -UsedMB 900 -MinReclaimMB 100 | Should -BeTrue
+    }
+    It 'uses the larger of used pages and the target floor' {
+        Test-ShrinkWorthwhile -AllocatedMB 1000 -UsedMB 100 -FloorMB 950 -MinReclaimMB 100 | Should -BeFalse
+    }
+    It 'is not worthwhile for a zero-size file' {
+        Test-ShrinkWorthwhile -AllocatedMB 0 -UsedMB 0 -MinReclaimMB 100 | Should -BeFalse
+    }
+    It 'ignores a tiny gain on a large file' {
+        Test-ShrinkWorthwhile -AllocatedMB 100000 -UsedMB 99950 -MinReclaimMB 100 | Should -BeFalse
+    }
+}
+
 Describe 'Get-ShrinkNextTargetMB' {
-    It 'steps down by 10 GB by default' {
-        $r = Get-ShrinkNextTargetMB -AllocatedMB 100000
-        $r.Done | Should -BeFalse
-        $r.TargetMB | Should -Be (100000 - 10240)
+    It 'steps down by 10 GiB by default' {
+        Get-ShrinkNextTargetMB -AllocatedMB 100000 | Should -Be (100000 - 10240)
     }
     It 'never goes below the floor' {
-        $r = Get-ShrinkNextTargetMB -AllocatedMB 12000 -FloorMB 10000
-        $r.TargetMB | Should -Be 10000
+        Get-ShrinkNextTargetMB -AllocatedMB 12000 -FloorMB 10000 | Should -Be 10000
     }
-    It 'reports Done when already at/below floor' {
-        (Get-ShrinkNextTargetMB -AllocatedMB 10000 -FloorMB 10000).Done | Should -BeTrue
+    It 'clamps to the floor when a full step would overshoot it' {
+        Get-ShrinkNextTargetMB -AllocatedMB 10500 -FloorMB 10000 | Should -Be 10000
     }
 }
 
@@ -93,11 +121,47 @@ Describe 'Select-ShrinkNextFile' {
     It 'picks the most reclaimable file' {
         (Select-ShrinkNextFile -Files $script:files).FileId | Should -Be 2
     }
-    It 'skips owned and given-up files' {
-        (Select-ShrinkNextFile -Files $script:files -OwnedFileIds @(2) -GivenUpFileIds @()).FileId | Should -Be 1
+    It 'skips owned and excluded files' {
+        (Select-ShrinkNextFile -Files $script:files -OwnedFileIds @(2) -ExcludedFileIds @()).FileId | Should -Be 1
+    }
+    It 'skips files that already reached a terminal state' {
+        (Select-ShrinkNextFile -Files $script:files -ExcludedFileIds @(2)).FileId | Should -Be 1
     }
     It 'returns null when nothing is reclaimable' {
         Select-ShrinkNextFile -Files @($script:files[2]) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-ShrinkBucketCounts' {
+    It 'tallies each bucket' {
+        $c = Get-ShrinkBucketCounts -Buckets @('Shrunk','Shrunk','AlreadyMinimal','AlreadyAtTarget','GaveUp','Shrunk','PartlyShrunk','Grew')
+        $c.Shrunk | Should -Be 3
+        $c.PartlyShrunk | Should -Be 1
+        $c.AlreadyMinimal | Should -Be 1
+        $c.AlreadyAtTarget | Should -Be 1
+        $c.Grew | Should -Be 1
+        $c.GaveUp | Should -Be 1
+    }
+    It 'returns zeros for an empty set' {
+        $c = Get-ShrinkBucketCounts -Buckets @()
+        $c.Shrunk | Should -Be 0
+        $c.PartlyShrunk | Should -Be 0
+        $c.AlreadyMinimal | Should -Be 0
+        $c.AlreadyAtTarget | Should -Be 0
+        $c.Grew | Should -Be 0
+        $c.GaveUp | Should -Be 0
+    }
+}
+
+Describe 'Get-ShrinkGaveUpBucket' {
+    It 'classifies a net reduction as PartlyShrunk' {
+        Get-ShrinkGaveUpBucket -StartAllocMB 1000 -FinalAllocMB 600 | Should -Be 'PartlyShrunk'
+    }
+    It 'classifies a net growth as Grew' {
+        Get-ShrinkGaveUpBucket -StartAllocMB 1000 -FinalAllocMB 1200 | Should -Be 'Grew'
+    }
+    It 'classifies no change as GaveUp' {
+        Get-ShrinkGaveUpBucket -StartAllocMB 1000 -FinalAllocMB 1000 | Should -Be 'GaveUp'
     }
 }
 
@@ -164,5 +228,20 @@ Describe 'New-ShrinkCommandText' {
     }
     It 'throws on TruncateOnly + NoTruncate' {
         { New-ShrinkCommandText -FileId 1 -TruncateOnly -NoTruncate } | Should -Throw
+    }
+}
+
+Describe 'Format-ShrinkSize' {
+    It 'formats <Mb> MiB as <Text>' -TestCases @(
+        @{ Mb = 0;       Text = '0 KiB' }
+        @{ Mb = 0.5;     Text = '512 KiB' }
+        @{ Mb = 1;       Text = '1.0 MiB' }
+        @{ Mb = 8;       Text = '8.0 MiB' }
+        @{ Mb = 1024;    Text = '1.0 GiB' }
+        @{ Mb = 1536;    Text = '1.5 GiB' }
+        @{ Mb = 1048576; Text = '1.0 TiB' }
+        @{ Mb = 1572864; Text = '1.5 TiB' }
+    ) {
+        Format-ShrinkSize -Megabytes $Mb | Should -Be $Text
     }
 }
