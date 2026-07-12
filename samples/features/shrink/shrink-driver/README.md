@@ -60,6 +60,7 @@ periodic per-file status report plus notable events (retries and cancellations).
 A summary at the end reports how each file ended up:
 
 - **Shrunk** — the file was reduced in size.
+- **Repacked** — with `-NoTruncate`, data pages were moved toward the front of the file; the allocated size is unchanged by design (space is not released).
 - **Partly shrunk** — reduced, but gave up before reaching the target or minimum size.
 - **Already at minimum** — already at its smallest possible size; nothing to reclaim.
 - **Already at target** — already at or below the requested target size.

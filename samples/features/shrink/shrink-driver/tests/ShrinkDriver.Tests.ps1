@@ -145,6 +145,32 @@ Describe 'Format-ShrinkKeyValueTable' {
     }
 }
 
+Describe 'Format-ShrinkTable' {
+    It 'returns nothing for an empty set' {
+        @(Format-ShrinkTable -Rows @()) | Should -BeNullOrEmpty
+    }
+    It 'renders a header, separator, and one line per row' {
+        $rows = @(
+            [ordered]@{ A = '1';  Name = 'x';  B = '10' }
+            [ordered]@{ A = '22'; Name = 'yy'; B = '3' }
+        )
+        $lines = @(Format-ShrinkTable -Rows $rows -RightAlign @('A', 'B'))
+        $lines.Count | Should -Be 4
+        $lines[0] | Should -Match 'A\s+Name\s+B'
+        $lines[1] | Should -Match '^-+\s+-+\s+-+$'
+    }
+    It 'right-aligns listed columns and left-aligns the rest' {
+        $rows = @(
+            [ordered]@{ Name = 'a';  Val = '1' }
+            [ordered]@{ Name = 'bb'; Val = '100' }
+        )
+        $lines = @(Format-ShrinkTable -Rows $rows -RightAlign @('Val'))
+        # Name left-aligned (short value flush left), Val right-aligned (short value padded left).
+        $lines[2] | Should -Match '^a\s+\S*1$'
+        $lines[3] | Should -Match '^bb\s+100$'
+    }
+}
+
 Describe 'Test-ShrinkWorthwhile' {
     It 'is worthwhile when reclaimable meets the minimum' {
         Test-ShrinkWorthwhile -AllocatedMB 1000 -UsedMB 100 -MinReclaimMB 100 | Should -BeTrue
@@ -272,8 +298,9 @@ Describe 'Select-ShrinkNextFile' {
 
 Describe 'Get-ShrinkBucketCounts' {
     It 'tallies each bucket' {
-        $c = Get-ShrinkBucketCounts -Buckets @('Shrunk','Shrunk','AlreadyMinimal','AlreadyAtTarget','GaveUp','Shrunk','PartlyShrunk','Grew')
+        $c = Get-ShrinkBucketCounts -Buckets @('Shrunk','Shrunk','AlreadyMinimal','AlreadyAtTarget','GaveUp','Shrunk','PartlyShrunk','Grew','Repacked','Repacked')
         $c.Shrunk | Should -Be 3
+        $c.Repacked | Should -Be 2
         $c.PartlyShrunk | Should -Be 1
         $c.AlreadyMinimal | Should -Be 1
         $c.AlreadyAtTarget | Should -Be 1
@@ -283,6 +310,7 @@ Describe 'Get-ShrinkBucketCounts' {
     It 'returns zeros for an empty set' {
         $c = Get-ShrinkBucketCounts -Buckets @()
         $c.Shrunk | Should -Be 0
+        $c.Repacked | Should -Be 0
         $c.PartlyShrunk | Should -Be 0
         $c.AlreadyMinimal | Should -Be 0
         $c.AlreadyAtTarget | Should -Be 0

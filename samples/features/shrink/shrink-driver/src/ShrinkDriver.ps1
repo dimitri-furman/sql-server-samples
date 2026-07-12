@@ -174,7 +174,7 @@ function Invoke-ShrinkDriver {
                     default {
                         if ($Message -match '^-{3,}') { 'Cyan' }                                          # section dividers/headers
                         elseif ($Message -match '(Grew|Gave up|Partly shrunk)\s*:\s*[1-9]') { 'Yellow' }  # non-zero problem outcomes
-                        elseif ($Message -match 'Shrunk\s*:\s*[1-9]') { 'Green' }                          # non-zero successful shrinks
+                        elseif ($Message -match '(Shrunk|Repacked)\s*:\s*[1-9]') { 'Green' }               # non-zero successful outcomes
                         else { $null }
                     }
                 }
@@ -344,16 +344,19 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
             })
         Write-ShrinkLog '-------------------- shrink potential report --------------------'
         Format-ShrinkFileReport -Files $report -TopN 100 | ForEach-Object { Write-ShrinkLog $_ }
+        $eligibleFiles = @($report | Where-Object { $_.IsEligible })
         $sumUsed = [long](($report | Measure-Object UsedMB -Sum).Sum)
         $sumAlloc = [long](($report | Measure-Object AllocatedMB -Sum).Sum)
-        $sumRecl = [long](($report | Measure-Object ReclaimableMB -Sum).Sum)
+        # Report only the space a shrink with these settings would actually reclaim (the eligible
+        # files); files below the threshold are left as-is, so they don't count toward the total.
+        $sumRecl = [long](($eligibleFiles | Measure-Object ReclaimableMB -Sum).Sum)
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
-                'Data files'         = $report.Count
-                'Eligible to shrink' = @($report | Where-Object { $_.IsEligible }).Count
-                'Used'               = (Format-ShrinkSize $sumUsed)
-                'Allocated'          = (Format-ShrinkSize $sumAlloc)
-                'Reclaimable'        = (Format-ShrinkSize $sumRecl)
+                'Data files'             = $report.Count
+                'Eligible to shrink'     = $eligibleFiles.Count
+                'Used'                   = (Format-ShrinkSize $sumUsed)
+                'Allocated'              = (Format-ShrinkSize $sumAlloc)
+                'Reclaimable (eligible)' = (Format-ShrinkSize $sumRecl)
             }) | ForEach-Object { Write-ShrinkLog $_ }
         Write-ShrinkLog '-------------------------------------------------'
         Write-ShrinkLog 'To shrink these files, run again with -Mode Shrink.'
@@ -378,6 +381,9 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
     $dbReadOnly = [int](Invoke-ShrinkScalar $control "SELECT CASE WHEN DATABASEPROPERTYEX(DB_NAME(), 'Updateability') = 'READ_ONLY' THEN 1 ELSE 0 END;")
     if ($dbReadOnly -eq 1) {
         throw "Database [$DatabaseName] is read-only; its files cannot be shrunk."
+    }
+    if ($NoTruncate) {
+        Write-ShrinkLog 'NoTruncate moves data pages toward the front of each file without releasing space; the allocated size will not change (each file is reported as Repacked).'
     }
 
     $allFiles = @(Get-EligibleFiles -Conn $control)
@@ -526,6 +532,16 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                             break
                         }
 
+                        if ($connParams.NoTruncate) {
+                            # NoTruncate moves allocated pages toward the front of the file but never
+                            # releases space, so the allocated size is unchanged by design. Treat a
+                            # completed pass as its own success (Repacked) rather than a give-up, and do
+                            # not loop: a second pass would not reduce the size either.
+                            $bucket = 'Repacked'
+                            Emit "File $($file.FileId) repacked; NoTruncate leaves the allocated size unchanged ($(Format-ShrinkSize $before))"
+                            break
+                        }
+
                         $after = if ($result) { [long]$result.CurrentMB } else { (Get-Size $conn $file.FileId).Alloc }
                         if ($after -lt $before) {
                             # Made progress this pass; keep shrinking.
@@ -662,29 +678,34 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                     }) } } finally { $rd.Dispose(); $cmd.Dispose() }
 
         Write-ShrinkLog '---- status ----'
+        $statusData = [System.Collections.Generic.List[object]]::new()
         foreach ($sess in $shared.Sessions.GetEnumerator() | Sort-Object { $_.Key }) {
             $workerId = $sess.Key; $s = $sess.Value
             $row = $rows | Where-Object Spid -eq $s.Spid | Select-Object -First 1
             if (-not $row) {
-                $fileLabel = if ($s.FileId) { " file $($s.FileId)" } else { '' }
-                Write-ShrinkLog ("worker {0} session ID {1}{2}: {3}" -f $workerId, $s.Spid, $fileLabel, $s.State); continue
+                $statusData.Add([pscustomobject]@{
+                        Worker = $workerId; Spid = $s.Spid; FileId = $s.FileId; UsedMB = $null; AllocMB = $null
+                        Cmd = ''; Status = $s.State; Pct = $null; ElapsedS = $null; Wait = ''; DCpu = ''; DReads = ''; Blocker = ''
+                    })
+                continue
             }
             $dCpu = '-'; $dReads = '-'
             if ($prev.ContainsKey($s.Spid)) {
                 $c = Get-ShrinkDeltaWithReset -Previous $prev[$s.Spid].Cpu -Current $row.Cpu
                 $rr = Get-ShrinkDeltaWithReset -Previous $prev[$s.Spid].Reads -Current $row.Reads
-                $dCpu = if ($c.IsReset) { 'reset' } else { $c.Delta }
-                $dReads = if ($rr.IsReset) { 'reset' } else { $rr.Delta }
+                $dCpu = if ($c.IsReset) { 'reset' } else { "$($c.Delta)" }
+                $dReads = if ($rr.IsReset) { 'reset' } else { "$($rr.Delta)" }
             }
             $prev[$s.Spid] = @{ Cpu = $row.Cpu; Reads = $row.Reads }
-            $fileSz = if ($s.FileId) {
-                $z = Get-ShrinkFileSize -Conn $control -FileId ([int]$s.FileId)
-                if ($z) { "$(Format-ShrinkSize $z.Used) / $(Format-ShrinkSize $z.Alloc) used/alloc" } else { '' }
-            } else { '' }
-            Write-ShrinkLog ("worker {0} session ID {1} file {2} cmd={3} status={4} wait={5}({6}ms) res='{7}' pct={8}% elapsed={9}s dCPU={10} dReads={11} blocker={12}{13} {14}" -f `
-                    $workerId, $s.Spid, $s.FileId, $row.Command, $row.Status, $row.Wait, $row.WaitTime, $row.WaitRes,
-                [math]::Round($row.Pct, 1), [int]($row.Elapsed / 1000), $dCpu, $dReads, $row.Blocker,
-                $(if ($row.Blocker) { "($($row.BlockerCmd))" } else { '' }), $fileSz)
+            $z = if ($s.FileId) { Get-ShrinkFileSize -Conn $control -FileId ([int]$s.FileId) } else { $null }
+            $statusData.Add([pscustomobject]@{
+                    Worker = $workerId; Spid = $s.Spid; FileId = $s.FileId
+                    UsedMB = $(if ($z) { $z.Used } else { $null }); AllocMB = $(if ($z) { $z.Alloc } else { $null })
+                    Cmd = $row.Command; Status = $row.Status; Pct = [math]::Round($row.Pct, 1); ElapsedS = [int]($row.Elapsed / 1000)
+                    Wait = $(if ($row.Wait) { "$($row.Wait) $($row.WaitTime)ms" } else { '' })
+                    DCpu = $dCpu; DReads = $dReads
+                    Blocker = $(if ($row.Blocker) { "$($row.Blocker) ($($row.BlockerCmd))" } else { '' })
+                })
 
             if (-not $stuckState.ContainsKey($s.Spid)) { $stuckState[$s.Spid] = @{ Blocker = 0; Cpu = 0; Reads = 0; StuckSince = $null } }
             $st = Update-ShrinkStuckState -State $stuckState[$s.Spid] -Blocker $row.Blocker -Cpu $row.Cpu -Reads $row.Reads -Now (Get-Date) -WindowSec $StuckWindowSeconds
@@ -694,6 +715,32 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 $stuckState[$s.Spid].StuckSince = $null
             }
         }
+        # Render the collected worker rows as one aligned table, using a single size unit chosen from
+        # the largest allocation so the used/allocated columns never mix units across workers.
+        $maxMb = 0.0
+        foreach ($d in $statusData) { if ($null -ne $d.AllocMB -and [double]$d.AllocMB -gt $maxMb) { $maxMb = [double]$d.AllocMB } }
+        $unit = Get-ShrinkSizeUnit -MaxMegabytes $maxMb
+        $numFmt = '{0:N' + $unit.Decimals + '}'
+        $usedHdr = "Used ($($unit.Name))"; $allocHdr = "Alloc ($($unit.Name))"
+        $statusTable = foreach ($d in $statusData) {
+            [ordered]@{
+                Worker    = [string]$d.Worker
+                SPID      = [string]$d.Spid
+                File      = $(if ($d.FileId) { [string]$d.FileId } else { '-' })
+                $usedHdr  = $(if ($null -ne $d.UsedMB) { $numFmt -f ([double]$d.UsedMB / $unit.PerMB) } else { '' })
+                $allocHdr = $(if ($null -ne $d.AllocMB) { $numFmt -f ([double]$d.AllocMB / $unit.PerMB) } else { '' })
+                '%Done'   = $(if ($null -ne $d.Pct) { [string]$d.Pct } else { '' })
+                Elapsed   = $(if ($null -ne $d.ElapsedS) { '{0}s' -f $d.ElapsedS } else { '' })
+                Cmd       = [string]$d.Cmd
+                Status    = [string]$d.Status
+                dCPU      = [string]$d.DCpu
+                dReads    = [string]$d.DReads
+                Blocker   = $(if ($d.Blocker) { [string]$d.Blocker } else { '-' })
+                Wait      = [string]$d.Wait
+            }
+        }
+        Format-ShrinkTable -Rows @($statusTable) -RightAlign @('Worker', 'SPID', 'File', $usedHdr, $allocHdr, '%Done', 'Elapsed', 'dCPU', 'dReads') |
+            ForEach-Object { Write-ShrinkLog $_ }
         $tot = Get-ShrinkDatabaseTotals -Conn $control
         $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
         [System.Threading.Monitor]::Enter($shared.Lock)
@@ -704,6 +751,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 'Used'               = (Format-ShrinkSize $dbUsedMb)
                 'Allocated'          = (Format-ShrinkSize $dbAllocMb)
                 'Shrunk'             = $c.Shrunk
+                'Repacked'           = $c.Repacked
                 'Partly shrunk'      = $c.PartlyShrunk
                 'Already at minimum' = $c.AlreadyMinimal
                 'Already at target'  = $c.AlreadyAtTarget
@@ -753,6 +801,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 'Used'               = (Format-ShrinkSize $dbUsedMb)
                 'Allocated'          = (Format-ShrinkSize $dbAllocMb)
                 'Shrunk'             = $c.Shrunk
+                'Repacked'           = $c.Repacked
                 'Partly shrunk'      = $c.PartlyShrunk
                 'Already at minimum' = $c.AlreadyMinimal
                 'Already at target'  = $c.AlreadyAtTarget
@@ -816,6 +865,35 @@ function Format-ShrinkKeyValueTable {
     )
     $width = ($Rows.Keys | Measure-Object -Property Length -Maximum).Maximum
     foreach ($k in $Rows.Keys) { '{0}{1} : {2}' -f $Indent, ([string]$k).PadRight($width), $Rows[$k] }
+}
+
+function Format-ShrinkTable {
+    <# .SYNOPSIS
+      Render rows (each an [ordered] dictionary of column -> value) as an aligned fixed-width table
+      with a header and separator. Columns whose names are listed in -RightAlign are right-justified;
+      all others are left-justified. Returns one string per line (empty when there are no rows). #>
+    [CmdletBinding()][OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
+        [string[]]$RightAlign = @()
+    )
+    if ($Rows.Count -eq 0) { return @() }
+    $cols = @($Rows[0].Keys)
+    $width = @{}
+    foreach ($c in $cols) {
+        $m = ([string]$c).Length
+        foreach ($r in $Rows) { $len = ([string]$r[$c]).Length; if ($len -gt $m) { $m = $len } }
+        $width[$c] = $m
+    }
+    $slots = for ($i = 0; $i -lt $cols.Count; $i++) {
+        if ($cols[$i] -in $RightAlign) { "{$i,$($width[$cols[$i]])}" } else { "{$i,-$($width[$cols[$i]])}" }
+    }
+    $fmt = $slots -join '  '
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add(($fmt -f $cols))
+    $lines.Add(($fmt -f @($cols | ForEach-Object { '-' * $width[$_] })))
+    foreach ($r in $Rows) { $lines.Add(($fmt -f @($cols | ForEach-Object { [string]$r[$_] }))) }
+    $lines.ToArray()
 }
 
 function Format-ShrinkFileReport {
@@ -914,6 +992,7 @@ function Get-ShrinkBucketCounts {
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Buckets)
     [pscustomobject]@{
         Shrunk          = @($Buckets | Where-Object { $_ -eq 'Shrunk' }).Count
+        Repacked        = @($Buckets | Where-Object { $_ -eq 'Repacked' }).Count
         PartlyShrunk    = @($Buckets | Where-Object { $_ -eq 'PartlyShrunk' }).Count
         AlreadyMinimal  = @($Buckets | Where-Object { $_ -eq 'AlreadyMinimal' }).Count
         AlreadyAtTarget = @($Buckets | Where-Object { $_ -eq 'AlreadyAtTarget' }).Count
