@@ -19,14 +19,19 @@ Describe 'Test-ShrinkParameterSet' {
         $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=5; AbortAfterWait='SELF'; TruncateOnly=$true; FileTargetSizeGiB=100 }
         ($e -join ';') | Should -Match 'FileTargetSizeGiB'
     }
-    It 'rejects Sessions < 1' {
-        $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=0; AbortAfterWait='SELF' }
-        ($e -join ';') | Should -Match 'Sessions'
-    }
     It 'requires login and password for SQL auth' {
         $e = Test-ShrinkParameterSet @{ AuthType='SQL'; Sessions=5; AbortAfterWait='SELF' }
         ($e -join ';') | Should -Match 'SqlLogin'
         ($e -join ';') | Should -Match 'SqlPassword'
+    }
+    It 'rejects a plain-text SqlPassword for SQL auth' {
+        $e = Test-ShrinkParameterSet @{ AuthType='SQL'; SqlLogin='u'; SqlPassword='p'; AbortAfterWait='SELF' }
+        ($e -join ';') | Should -Match 'SecureString'
+    }
+    It 'accepts a SecureString SqlPassword for SQL auth' {
+        $sec = ConvertTo-SecureString 'p' -AsPlainText -Force
+        $e = Test-ShrinkParameterSet @{ AuthType='SQL'; SqlLogin='u'; SqlPassword=$sec; AbortAfterWait='SELF' }
+        ($e -join ';') | Should -Not -Match 'SqlPassword'
     }
     It 'rejects an invalid AbortAfterWait' {
         $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=5; AbortAfterWait='NONE' }
@@ -38,15 +43,64 @@ Describe 'Test-ShrinkParameterSet' {
     }
 }
 
-Describe 'Get-ShrinkClampedRetryCount' {
-    It 'clamps <in> to <out>' -TestCases @(
-        @{ In = 0;  Out = 1 }
-        @{ In = -1; Out = 1 }
-        @{ In = 51; Out = 50 }
-        @{ In = 50; Out = 50 }
-        @{ In = 5;  Out = 5 }
+Describe 'Resolve-ShrinkLogPath' {
+    It 'returns the full path for a writable file in an existing directory' {
+        $p = Join-Path $TestDrive 'shrink.log'
+        Resolve-ShrinkLogPath -Path $p | Should -Be ([System.IO.Path]::GetFullPath($p))
+    }
+    It 'creates the file if it does not yet exist' {
+        $p = Join-Path $TestDrive 'created.log'
+        Resolve-ShrinkLogPath -Path $p | Out-Null
+        Test-Path -LiteralPath $p | Should -BeTrue
+    }
+    It 'resolves a relative path against the current location' {
+        Push-Location $TestDrive
+        try {
+            $expected = Join-Path (Get-Location).ProviderPath 'rel.log'
+            Resolve-ShrinkLogPath -Path 'rel.log' | Should -Be $expected
+        } finally { Pop-Location }
+    }
+    It 'throws when the directory does not exist' {
+        $p = Join-Path $TestDrive 'missing-dir\deep\x.log'
+        { Resolve-ShrinkLogPath -Path $p } | Should -Throw '*does not exist*'
+    }
+    It 'throws when the path is a directory' {
+        { Resolve-ShrinkLogPath -Path $TestDrive } | Should -Throw '*is a directory*'
+    }
+}
+
+Describe 'Numeric parameter validation' {
+    It '<Param> declares ValidateRange <Min>..<Max>' -TestCases @(
+        @{ Param = 'Sessions';              Min = 1; Max = [int]::MaxValue }
+        @{ Param = 'RetryCount';            Min = 0; Max = 50 }
+        @{ Param = 'FileTargetSizeGiB';     Min = 0; Max = [int]::MaxValue }
+        @{ Param = 'MaxRuntimeMinutes';     Min = 1; Max = [int]::MaxValue }
+        @{ Param = 'StepGiB';               Min = 1; Max = [int]::MaxValue }
+        @{ Param = 'MinReclaimGiB';         Min = 0; Max = [int]::MaxValue }
+        @{ Param = 'StatusIntervalSeconds'; Min = 1; Max = [int]::MaxValue }
+        @{ Param = 'StuckWindowSeconds';    Min = 1; Max = [int]::MaxValue }
     ) {
-        Get-ShrinkClampedRetryCount -RetryCount $In | Should -Be $Out
+        $range = (Get-Command Invoke-ShrinkDriver).Parameters[$Param].Attributes |
+            Where-Object { $_ -is [ValidateRange] } | Select-Object -First 1
+        $range | Should -Not -BeNullOrEmpty
+        $range.MinRange | Should -Be $Min
+        $range.MaxRange | Should -Be $Max
+    }
+
+    It 'rejects <Param>=<Value> as out of range' -TestCases @(
+        @{ Param = 'Sessions';              Value = 0 }
+        @{ Param = 'RetryCount';            Value = -1 }
+        @{ Param = 'RetryCount';            Value = 51 }
+        @{ Param = 'FileTargetSizeGiB';     Value = -1 }
+        @{ Param = 'MaxRuntimeMinutes';     Value = 0 }
+        @{ Param = 'StepGiB';               Value = 0 }
+        @{ Param = 'MinReclaimGiB';         Value = -1 }
+        @{ Param = 'StatusIntervalSeconds'; Value = 0 }
+        @{ Param = 'StuckWindowSeconds';    Value = 0 }
+    ) {
+        $splat = @{ ServerName = 's'; DatabaseName = 'd'; $Param = $Value }
+        { Invoke-ShrinkDriver @splat } |
+            Should -Throw -ErrorId 'ParameterArgumentValidationError,Invoke-ShrinkDriver'
     }
 }
 

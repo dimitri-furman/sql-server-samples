@@ -48,39 +48,47 @@ function Invoke-ShrinkDriver {
     .PARAMETER SqlLogin
       Login name; required when AuthType is SQL.
     .PARAMETER SqlPassword
-      Password as a SecureString; required when AuthType is SQL.
+      Password as a SecureString; required when AuthType is SQL. Pass a SecureString, not plain
+      text - for example: $pw = Read-Host -AsSecureString 'SQL password'. A plain string is rejected.
     .PARAMETER Sessions
-      Number of files to shrink concurrently (default 5). Capped at the eligible file count.
+      The maximum number of files to shrink concurrently (default 5). Capped at the eligible file count.
     .PARAMETER TruncateOnly
-      Release free space at the end of each file only, without moving data.
+      Release unused space at the end of each file only, without moving data.
     .PARAMETER NoTruncate
-      Compact each file without releasing the freed space.
+      Compact each file without releasing the unused space.
     .PARAMETER WaitAtLowPriority
       Run shrink at low lock priority to reduce blocking of other queries (default true).
     .PARAMETER AbortAfterWait
-      On a low-priority wait timeout, abort this shrink (SELF, default) or kill the
+      On a low-priority wait timeout, abort file shrink (SELF, default) or kill the
       blocking sessions (BLOCKERS). BLOCKERS terminates other transactions, use with caution.
     .PARAMETER FileTargetSizeGiB
       Optional per-file floor in GiB; no file is shrunk below this size.
     .PARAMETER RetryCount
-      Retry attempts per file for transient failures (default 5, maximum 50).
+      Retry attempts per file for transient failures (default 5, range 0-50; 0 disables retries).
     .PARAMETER MaxRuntimeMinutes
       Optional overall time budget; the run stops when it is reached.
     .PARAMETER StepGiB
       Increment size used for gradual shrinking (default 10 GiB).
     .PARAMETER MinReclaimGiB
-      Minimum free space per file, in GiB, worth running a shrink pass to reclaim. A file whose unused space -
+      Minimum unused space per file, in GiB, worth running a shrink pass to reclaim. A file whose unused space -
       or a file's remaining unused space after earlier passes - is below this is left as is (default 1 GiB).
     .PARAMETER StatusIntervalSeconds
       How often the status report is written, in seconds (default 180).
     .PARAMETER StuckWindowSeconds
       A shrink blocked with no progress for this long is cancelled and retried (default 300).
+      Stuck detection runs only at each status report, so this is effectively rounded up to a
+      multiple of StatusIntervalSeconds; a value below StatusIntervalSeconds is raised to it.
     .PARAMETER LogPath
-      Log file path. Defaults to a timestamped file next to this script.
+      Log file path. Defaults to a timestamped file next to this script. The parent directory
+      must already exist and be writable; otherwise the run stops before doing any work.
     .EXAMPLE
       Invoke-ShrinkDriver -ServerName myserver.database.windows.net -DatabaseName MyDb -Sessions 5
     .EXAMPLE
-      Invoke-ShrinkDriver -ServerName sql01 -DatabaseName Sales -AuthType Windows -FileTargetSizeGiB 500 -Sessions 8
+      Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -AuthType Windows -FileTargetSizeGiB 500 -Sessions 8
+    .LINK
+      https://learn.microsoft.com/azure/azure-sql/database/file-space-manage
+    .LINK
+      https://learn.microsoft.com/sql/t-sql/database-console-commands/dbcc-shrinkfile-transact-sql
     #>
     [CmdletBinding()]
     param(
@@ -89,22 +97,22 @@ function Invoke-ShrinkDriver {
 
         [ValidateSet('EntraID', 'Windows', 'SQL')][string]$AuthType = 'EntraID',
         [string]$SqlLogin,
-        [securestring]$SqlPassword,
+        [object]$SqlPassword,
 
-        [int]$Sessions = 5,
+        [ValidateRange(1, [int]::MaxValue)][int]$Sessions = 5,
         [switch]$TruncateOnly,
         [switch]$NoTruncate,
         [bool]$WaitAtLowPriority = $true,
         [ValidateSet('SELF', 'BLOCKERS')][string]$AbortAfterWait = 'SELF',
 
-        [Nullable[int]]$FileTargetSizeGiB = $null,
-        [int]$RetryCount = 5,
-        [Nullable[int]]$MaxRuntimeMinutes = $null,
+        [ValidateRange(0, [int]::MaxValue)][Nullable[int]]$FileTargetSizeGiB = $null,
+        [ValidateRange(0, 50)][int]$RetryCount = 5,
+        [ValidateRange(1, [int]::MaxValue)][Nullable[int]]$MaxRuntimeMinutes = $null,
 
-        [int]$StepGiB = 10,
-        [int]$MinReclaimGiB = 1,
-        [int]$StatusIntervalSeconds = 180,
-        [int]$StuckWindowSeconds = 300,
+        [ValidateRange(1, [int]::MaxValue)][int]$StepGiB = 10,
+        [ValidateRange(0, [int]::MaxValue)][int]$MinReclaimGiB = 1,
+        [ValidateRange(1, [int]::MaxValue)][int]$StatusIntervalSeconds = 180,
+        [ValidateRange(1, [int]::MaxValue)][int]$StuckWindowSeconds = 300,
         [string]$LogPath
     )
 
@@ -115,7 +123,7 @@ function Invoke-ShrinkDriver {
     # ----- validate parameters -----
     $paramSet = @{
         AuthType = $AuthType; SqlLogin = $SqlLogin; SqlPassword = $SqlPassword
-        Sessions = $Sessions; TruncateOnly = [bool]$TruncateOnly; NoTruncate = [bool]$NoTruncate
+        TruncateOnly = [bool]$TruncateOnly; NoTruncate = [bool]$NoTruncate
         WaitAtLowPriority = $WaitAtLowPriority; AbortAfterWait = $AbortAfterWait
         FileTargetSizeGiB = $(if ($hasTarget) { [int]$FileTargetSizeGiB } else { $null })
     }
@@ -124,7 +132,6 @@ function Invoke-ShrinkDriver {
         $validationErrors | ForEach-Object { Write-Error $_ }
         throw "Parameter validation failed with $($validationErrors.Count) error(s)."
     }
-    $RetryCount = Get-ShrinkClampedRetryCount -RetryCount $RetryCount
     $stepMB = [long]$StepGiB * 1024
     $floorMB = if ($hasTarget) { [long]$FileTargetSizeGiB * 1024 } else { $null }
     $minReclaimMB = [long]$MinReclaimGiB * 1024
@@ -134,6 +141,9 @@ function Invoke-ShrinkDriver {
         $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
         $LogPath = Join-Path $PSScriptRoot ("shrink-{0}.log" -f $stamp)
     }
+    # Validate up front so a bad path fails fast with a clear message instead of failing
+    # part-way through the run; also normalizes to a full path for the logged 'LogFile' value.
+    $LogPath = Resolve-ShrinkLogPath -Path $LogPath
     $logLock = [object]::new()
     function Write-ShrinkLog {
         param([string]$Message, [string]$Level = 'INFO')
@@ -164,6 +174,12 @@ function Invoke-ShrinkDriver {
     ) | ForEach-Object { Write-ShrinkLog $_ }
     if ($WaitAtLowPriority -and $AbortAfterWait -eq 'BLOCKERS') {
         Write-ShrinkLog 'AbortAfterWait=BLOCKERS will roll back transactions that block shrink. Use with caution.' 'WARN'
+    }
+    # Stuck detection only runs at each status report, so a stuck window finer than the report
+    # cadence cannot be honored. Raise it to the report interval and tell the user.
+    if ($StuckWindowSeconds -lt $StatusIntervalSeconds) {
+        Write-ShrinkLog ("StuckWindowSeconds ({0}s) is below StatusIntervalSeconds ({1}s); stuck detection only runs at each status report, so raising StuckWindowSeconds to {1}s." -f $StuckWindowSeconds, $StatusIntervalSeconds) 'WARN'
+        $StuckWindowSeconds = $StatusIntervalSeconds
     }
 
     # Log any terminating error to the file before it propagates to the console.
@@ -402,7 +418,7 @@ ORDER BY (df.size - CAST(FILEPROPERTY(df.name, 'SpaceUsed') AS bigint)) DESC;
                                 Emit "File $($file.FileId) truncated to $(Format-ShrinkSize $after)"
                             } else {
                                 $bucket = 'AlreadyMinimal'
-                                Emit "File $($file.FileId) had no free space to truncate ($(Format-ShrinkSize $after))"
+                                Emit "File $($file.FileId) had no unused space to truncate ($(Format-ShrinkSize $after))"
                             }
                             break
                         }
@@ -434,15 +450,15 @@ ORDER BY (df.size - CAST(FILEPROPERTY(df.name, 'SpaceUsed') AS bigint)) DESC;
                         }
                         else {
                             # No progress, yet the pre-check confirmed there was more than MinReclaimMB of
-                            # free space to reclaim. Retrying has no high confidence of helping.
+                            # unused space to reclaim. Retrying has no high confidence of helping.
                             # Stop and report a partial result.
                             if ($after -lt $startAlloc) {
                                 $bucket = 'PartlyShrunk'
-                                $bucketReason = "reduced from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $after), but the remaining free space could not be reclaimed"
-                                Emit "File $($file.FileId) partly shrunk to $(Format-ShrinkSize $after); the remaining free space could not be reclaimed"
+                                $bucketReason = "reduced from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $after), but the remaining unused space could not be reclaimed"
+                                Emit "File $($file.FileId) partly shrunk to $(Format-ShrinkSize $after); the remaining unused space could not be reclaimed"
                             } else {
                                 $bucket = 'GaveUp'
-                                $bucketReason = "the shrink could not reclaim any of the free space"
+                                $bucketReason = "the shrink could not reclaim any of the unused space"
                                 Emit "Gave up on file $($file.FileId): $bucketReason"
                             }
                             break
@@ -625,13 +641,13 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         # Flush any worker events that arrived after the last poll, then write a single final summary.
         $evt = ''
         while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
-        $elapsedMin = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+        $elapsed = Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime)
         $dbUsedMb = [double](Invoke-ShrinkScalar $control "SELECT SUM(CAST(ISNULL(FILEPROPERTY(name,'SpaceUsed'),0) AS bigint))/128.0 FROM sys.database_files WHERE type_desc='ROWS';")
         $dbAllocMb = [double](Invoke-ShrinkScalar $control "SELECT SUM(CAST(size AS bigint))/128.0 FROM sys.database_files WHERE type_desc='ROWS';")
         $c = Get-ShrinkBucketCounts -Buckets @($shared.Completed.Values | ForEach-Object { $_.Bucket })
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
-                'Elapsed (min)'      = $elapsedMin
+                'Elapsed'            = $elapsed
                 'Used'               = (Format-ShrinkSize $dbUsedMb)
                 'Allocated'          = (Format-ShrinkSize $dbAllocMb)
                 'Shrunk'             = $c.Shrunk
@@ -664,6 +680,18 @@ function Format-ShrinkSize {
     else { '{0:N0} KiB' -f ($Megabytes * 1024) }
 }
 
+function Format-ShrinkDuration {
+    <# .SYNOPSIS Format a TimeSpan as a compact "Dd Hh Mm Ss" duration, omitting leading zero units. #>
+    [CmdletBinding()][OutputType([string])]
+    param([Parameter(Mandatory)][TimeSpan]$TimeSpan)
+    $parts = @()
+    if ($TimeSpan.Days -gt 0) { $parts += '{0}d' -f $TimeSpan.Days }
+    if ($parts.Count -gt 0 -or $TimeSpan.Hours -gt 0) { $parts += '{0}h' -f $TimeSpan.Hours }
+    if ($parts.Count -gt 0 -or $TimeSpan.Minutes -gt 0) { $parts += '{0}m' -f $TimeSpan.Minutes }
+    $parts += '{0}s' -f $TimeSpan.Seconds
+    $parts -join ' '
+}
+
 function Format-ShrinkKeyValueTable {
     <# .SYNOPSIS Render ordered label/value pairs as aligned two-column rows (one string per row). #>
     [CmdletBinding()][OutputType([string[]])]
@@ -677,7 +705,7 @@ function Format-ShrinkKeyValueTable {
 
 function Test-ShrinkWorthwhile {
     <# .SYNOPSIS
-      True if at least MinReclaimMB of space can be reclaimed from the file - that is, the free space
+      True if at least MinReclaimMB of space can be reclaimed from the file - that is, the unused space
       above its effective floor (the larger of its used pages and any target floor). #>
     [CmdletBinding()][OutputType([bool])]
     param(
@@ -733,15 +761,15 @@ function Test-ShrinkParameterSet {
     if ($Params['TruncateOnly'] -and $null -ne $Params['FileTargetSizeGiB']) {
         $errors.Add('FileTargetSizeGiB is not compatible with TruncateOnly (truncate-only does no data movement).')
     }
-    if ([int]($Params['Sessions'] ?? 0) -lt 1) {
-        $errors.Add('Sessions must be >= 1.')
-    }
     if ($Params['AuthType'] -eq 'SQL') {
         if ([string]::IsNullOrWhiteSpace([string]$Params['SqlLogin'])) {
             $errors.Add('SqlLogin is required for SQL authentication.')
         }
-        if (-not $Params['SqlPassword']) {
+        $pw = $Params['SqlPassword']
+        if (-not $pw) {
             $errors.Add('SqlPassword is required for SQL authentication.')
+        } elseif ($pw -isnot [securestring]) {
+            $errors.Add("SqlPassword must be a SecureString, not plain text. Create one with: `$pw = Read-Host -AsSecureString 'SQL password'; then pass -SqlPassword `$pw.")
         }
     }
     if ($Params['AuthType'] -notin @('EntraID', 'Windows', 'SQL')) {
@@ -753,11 +781,32 @@ function Test-ShrinkParameterSet {
     , $errors.ToArray()
 }
 
-function Get-ShrinkClampedRetryCount {
-    <# .SYNOPSIS Clamp a retry count to the allowed range 1..50. #>
-    [CmdletBinding()][OutputType([int])]
-    param([Parameter(Mandatory)][int]$RetryCount)
-    [Math]::Min(50, [Math]::Max(1, $RetryCount))
+function Resolve-ShrinkLogPath {
+    <# .SYNOPSIS
+      Resolve a log file path to a full path and confirm its directory exists and the file is
+      writable, creating the (empty) file if needed. Throws a clear error if the path is invalid,
+      its directory is missing, the path is a directory, or it cannot be written. #>
+    [CmdletBinding()][OutputType([string])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Resolve relative paths against the caller's PowerShell location ($PWD).
+    try { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) }
+    catch { throw "LogPath '$Path' is not a valid path: $($_.Exception.Message)" }
+
+    $dir = [System.IO.Path]::GetDirectoryName($full)
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw "LogPath directory '$dir' does not exist. Create it or choose a different -LogPath."
+    }
+    if (Test-Path -LiteralPath $full -PathType Container) {
+        throw "LogPath '$full' is a directory. Specify a file path for -LogPath."
+    }
+    try {
+        $fs = [System.IO.File]::Open($full, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $fs.Dispose()
+    } catch {
+        throw "LogPath '$full' is not writable: $($_.Exception.Message)"
+    }
+    $full
 }
 
 function Get-ShrinkBackoffSeconds {
