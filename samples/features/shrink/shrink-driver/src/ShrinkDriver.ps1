@@ -234,15 +234,20 @@ function Invoke-ShrinkDriver {
         $csb = [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new()
         $csb['Data Source'] = $ServerName; $csb['Initial Catalog'] = $DatabaseName
         $csb['Encrypt'] = $true; $csb['Connect Timeout'] = 30; $csb['Application Name'] = 'ShrinkDriver'
+        # A connection-level retry provider rides out transient open failures (for example an Azure
+        # SQL restart or failover). It is a shallow inner retry; callers keep their own retry loop.
+        $retry = New-ShrinkRetryProvider
         if ($AuthType -eq 'Windows') {
             $csb['Integrated Security'] = $true
             $conn = [Microsoft.Data.SqlClient.SqlConnection]::new(); $conn.ConnectionString = $csb.ConnectionString
+            if ($retry) { $conn.RetryLogicProvider = $retry }
             $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
         }
         if ($AuthType -eq 'SQL') {
             $conn = [Microsoft.Data.SqlClient.SqlConnection]::new(); $conn.ConnectionString = $csb.ConnectionString
             $pw = $SqlPassword.Copy(); $pw.MakeReadOnly()
             $conn.Credential = [Microsoft.Data.SqlClient.SqlCredential]::new($SqlLogin, $pw)
+            if ($retry) { $conn.RetryLogicProvider = $retry }
             $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
         }
         # EntraID: try the ambient credential (managed identity, Azure CLI, Azure PowerShell,
@@ -251,6 +256,7 @@ function Invoke-ShrinkDriver {
         foreach ($mode in @('Active Directory Default', 'Active Directory Interactive')) {
             $conn = [Microsoft.Data.SqlClient.SqlConnection]::new()
             $csb['Authentication'] = $mode; $conn.ConnectionString = $csb.ConnectionString
+            if ($retry) { $conn.RetryLogicProvider = $retry }
             try {
                 $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $mode }
             } catch {
@@ -279,7 +285,7 @@ function Invoke-ShrinkDriver {
         param([Microsoft.Data.SqlClient.SqlConnection]$Conn)
         $sql = @'
 SELECT df.file_id, df.name,
-       CAST(df.size / 128.0 AS bigint)                            AS alloc_mb,
+       CAST(df.size / 128.0 AS bigint) AS alloc_mb,
        CAST(FILEPROPERTY(df.name, 'SpaceUsed') / 128.0 AS bigint) AS used_mb
 FROM sys.database_files df
 JOIN sys.filegroups fg ON df.data_space_id = fg.data_space_id
@@ -438,6 +444,8 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                 }
                 default { $csb['Authentication'] = $connParams.EntraMode; $c.ConnectionString = $csb.ConnectionString }
             }
+            $retry = New-ShrinkRetryProvider
+            if ($retry) { $c.RetryLogicProvider = $retry }
             $c.Open(); $c
         }
         function Emit($msg) { $shared.Events.Enqueue(('worker {0}: {1}' -f $workerId, $msg)) }
@@ -448,11 +456,35 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
             try { if ($rd.Read()) { @{ Alloc = [long]$rd['a']; Used = [long]$rd['u'] } } else { $null } }
             finally { $rd.Dispose(); $cmd.Dispose() }
         }
+        function Get-WConnResilient {
+            # Re-establish the worker connection, tolerating a server that is briefly offline (for
+            # example during an Azure SQL restart or failover). New-WConn's connection-level retry
+            # provider handles transient errors; this loop is the outer backstop that keeps trying,
+            # with backoff, for errors outside that list so a 1-2 minute outage does not kill the
+            # worker. On success it also refreshes the session's SPID (a reconnect gets a new one) so
+            # the status report keeps tracking the worker. Throws if it cannot reconnect in the bound.
+            $maxTries = [Math]::Max(10, [int]$connParams.RetryCount)
+            for ($try = 1; $try -le $maxTries; $try++) {
+                if ($shared.Stop) { throw [System.OperationCanceledException]::new('stop requested during reconnect') }
+                try {
+                    $newConn = New-WConn
+                    $spidCmd = $newConn.CreateCommand(); $spidCmd.CommandText = 'SELECT @@SPID'
+                    $shared.Sessions[$workerId].Spid = [int]$spidCmd.ExecuteScalar(); $spidCmd.Dispose()
+                    return $newConn
+                }
+                catch {
+                    if ($try -eq $maxTries) { throw }
+                    $w = Get-ShrinkBackoffSeconds -Attempt $try
+                    Emit "reconnect attempt $try/$maxTries failed ($($_.Exception.Message.Split([Environment]::NewLine)[0])); retrying in $([int]$w)s"
+                    Start-Sleep -Seconds $w
+                }
+            }
+        }
 
         $conn = New-WConn
         $spidCmd = $conn.CreateCommand(); $spidCmd.CommandText = 'SELECT @@SPID'
         $spid = [int]$spidCmd.ExecuteScalar(); $spidCmd.Dispose()
-        $shared.Sessions[$workerId] = @{ Spid = $spid; Command = $null; FileId = $null; State = 'Idle' }
+        $shared.Sessions[$workerId] = @{ Spid = $spid; Command = $null; FileId = $null; State = 'Idle'; ConnectTime = (Get-Date); RequestSeq = 0 }
         Emit "Connected (session ID $spid)"
 
         try {
@@ -474,8 +506,17 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                 $startAlloc = $null            # allocated size (MB) when this worker took the file
                 $bucket = $null                # terminal outcome: Shrunk | PartlyShrunk | AlreadyMinimal | AlreadyAtTarget | Grew | GaveUp
                 $bucketReason = $null          # detail text, recorded for the give-up outcomes
+                $connLost = $false             # set if the connection dropped and could not be re-established
                 while (-not $shared.Stop) {
-                    $sz = Get-Size $conn $file.FileId
+                    $sz = $null
+                    try { $sz = Get-Size $conn $file.FileId }
+                    catch [Microsoft.Data.SqlClient.SqlException] {
+                        # The server dropped the connection between shrink steps; reconnect and retry.
+                        try { $conn.Dispose() } catch {}
+                        try { $conn = Get-WConnResilient } catch { $connLost = $true }
+                        if ($connLost) { break }
+                        continue
+                    }
                     if (-not $sz) { break }
                     if ($null -eq $startAlloc) { $startAlloc = $sz.Alloc }
 
@@ -507,6 +548,10 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                     }
 
                     $cmd = $conn.CreateCommand(); $cmd.CommandText = $sql; $cmd.CommandTimeout = 0
+                    # A new DBCC SHRINKFILE step is a new request, so its per-request cpu_time/reads/writes
+                    # counters restart at zero. Bump the sequence the status report uses to key its deltas
+                    # so it only differences counters within one request, never across a step boundary.
+                    $shared.Sessions[$workerId].RequestSeq++
                     $shared.Sessions[$workerId].Command = $cmd
                     $before = $sz.Alloc
                     try {
@@ -602,7 +647,17 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                         }
                         $wait = Get-ShrinkBackoffSeconds -Attempt $attempt
                         Emit "File $($file.FileId) MSSQL error $num (retry $attempt in $([int]$wait)s): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
-                        if ($conn.State -ne 'Open') { try { $conn.Dispose() } catch {}; Start-Sleep -Seconds $wait; $conn = New-WConn }
+                        if ($conn.State -ne 'Open') {
+                            try { $conn.Dispose() } catch {}
+                            Start-Sleep -Seconds $wait
+                            try { $conn = Get-WConnResilient }
+                            catch {
+                                $bucket = Get-ShrinkGaveUpBucket -StartAllocMB $startAlloc -FinalAllocMB $before
+                                $bucketReason = "lost the connection to the server and could not reconnect: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+                                Emit "Gave up on file $($file.FileId): $bucketReason"
+                                $connLost = $true; break
+                            }
+                        }
                         else { Start-Sleep -Seconds $wait }
                     } finally {
                         $shared.Sessions[$workerId].Command = $null
@@ -621,6 +676,7 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                     try { $shared.Owned.Remove($file.FileId) } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
                 }
                 $shared.Sessions[$workerId].FileId = $null; $shared.Sessions[$workerId].State = 'Idle'
+                if ($connLost) { Emit 'connection lost and not recoverable; worker stopping'; break }
             }
         } finally {
             $shared.Sessions[$workerId].State = 'Stopped'
@@ -664,7 +720,7 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
         $sql = @"
 SELECT r.session_id, r.status, r.command, ISNULL(r.wait_type,'') AS wait_type, r.wait_time,
        ISNULL(r.wait_resource,'') AS wait_resource, r.percent_complete, r.total_elapsed_time,
-       r.cpu_time, r.reads, ISNULL(r.blocking_session_id,0) AS blocker,
+       r.cpu_time, r.reads, r.writes, ISNULL(r.blocking_session_id,0) AS blocker,
        ISNULL((SELECT TOP 1 b.command FROM sys.dm_exec_requests b WHERE b.session_id = r.blocking_session_id),'') AS blocker_cmd
 FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
 "@
@@ -674,45 +730,56 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                         Spid = [int]$rd['session_id']; Status = [string]$rd['status']; Command = [string]$rd['command']
                         Wait = [string]$rd['wait_type']; WaitTime = [long]$rd['wait_time']; WaitRes = [string]$rd['wait_resource']
                         Pct = [double]$rd['percent_complete']; Elapsed = [long]$rd['total_elapsed_time']
-                        Cpu = [long]$rd['cpu_time']; Reads = [long]$rd['reads']; Blocker = [int]$rd['blocker']; BlockerCmd = [string]$rd['blocker_cmd']
+                        Cpu = [long]$rd['cpu_time']; Reads = [long]$rd['reads']; Writes = [long]$rd['writes']; Blocker = [int]$rd['blocker']; BlockerCmd = [string]$rd['blocker_cmd']
                     }) } } finally { $rd.Dispose(); $cmd.Dispose() }
 
         Write-ShrinkLog '---- status ----'
         $statusData = [System.Collections.Generic.List[object]]::new()
         foreach ($sess in $shared.Sessions.GetEnumerator() | Sort-Object { $_.Key }) {
             $workerId = $sess.Key; $s = $sess.Value
+            $seq = [int]$s.RequestSeq
+            # Elapsed is the worker's wall-clock time since it connected.
+            $sessElapsedS = if ($s.ConnectTime) { [int]((Get-Date) - [datetime]$s.ConnectTime).TotalSeconds } else { $null }
             $row = $rows | Where-Object Spid -eq $s.Spid | Select-Object -First 1
             if (-not $row) {
                 $statusData.Add([pscustomobject]@{
                         Worker = $workerId; Spid = $s.Spid; FileId = $s.FileId; UsedMB = $null; AllocMB = $null
-                        Cmd = ''; Status = $s.State; Pct = $null; ElapsedS = $null; Wait = ''; DCpu = ''; DReads = ''; Blocker = ''
+                        Cmd = ''; Status = $s.State; Pct = $null; ElapsedS = $sessElapsedS; Increment = $seq
+                        Wait = ''; DCpu = '-'; DReads = '-'; DWrites = '-'; Blocker = ''
                     })
                 continue
             }
-            $dCpu = '-'; $dReads = '-'
-            if ($prev.ContainsKey($s.Spid)) {
+            # cpu_time/reads/writes in dm_exec_requests are per-request and restart on each new shrink step,
+            # so a delta is only meaningful when the increment is unchanged since the last report; otherwise
+            # show '-'.
+            $dCpu = '-'; $dReads = '-'; $dWrites = '-'
+            if ($prev.ContainsKey($s.Spid) -and $prev[$s.Spid].Seq -eq $seq) {
                 $c = Get-ShrinkDeltaWithReset -Previous $prev[$s.Spid].Cpu -Current $row.Cpu
                 $rr = Get-ShrinkDeltaWithReset -Previous $prev[$s.Spid].Reads -Current $row.Reads
-                $dCpu = if ($c.IsReset) { 'reset' } else { "$($c.Delta)" }
-                $dReads = if ($rr.IsReset) { 'reset' } else { "$($rr.Delta)" }
+                $rw = Get-ShrinkDeltaWithReset -Previous $prev[$s.Spid].Writes -Current $row.Writes
+                $dCpu = if ($c.IsReset) { '-' } else { '{0:N0}' -f $c.Delta }
+                $dReads = if ($rr.IsReset) { '-' } else { '{0:N0}' -f $rr.Delta }
+                $dWrites = if ($rw.IsReset) { '-' } else { '{0:N0}' -f $rw.Delta }
             }
-            $prev[$s.Spid] = @{ Cpu = $row.Cpu; Reads = $row.Reads }
+            $prev[$s.Spid] = @{ Seq = $seq; Cpu = $row.Cpu; Reads = $row.Reads; Writes = $row.Writes }
             $z = if ($s.FileId) { Get-ShrinkFileSize -Conn $control -FileId ([int]$s.FileId) } else { $null }
             $statusData.Add([pscustomobject]@{
                     Worker = $workerId; Spid = $s.Spid; FileId = $s.FileId
                     UsedMB = $(if ($z) { $z.Used } else { $null }); AllocMB = $(if ($z) { $z.Alloc } else { $null })
-                    Cmd = $row.Command; Status = $row.Status; Pct = [math]::Round($row.Pct, 1); ElapsedS = [int]($row.Elapsed / 1000)
+                    Cmd = $row.Command; Status = $row.Status; Pct = [math]::Round($row.Pct, 1); ElapsedS = $sessElapsedS; Increment = $seq
                     Wait = $(if ($row.Wait) { "$($row.Wait) $($row.WaitTime)ms" } else { '' })
-                    DCpu = $dCpu; DReads = $dReads
+                    DCpu = $dCpu; DReads = $dReads; DWrites = $dWrites
                     Blocker = $(if ($row.Blocker) { "$($row.Blocker) ($($row.BlockerCmd))" } else { '' })
                 })
 
-            if (-not $stuckState.ContainsKey($s.Spid)) { $stuckState[$s.Spid] = @{ Blocker = 0; Cpu = 0; Reads = 0; StuckSince = $null } }
+            if (-not $stuckState.ContainsKey($s.Spid)) { $stuckState[$s.Spid] = @{ Blocker = 0; Cpu = 0; Reads = 0; BlockerSince = $null; NoProgressSince = $null } }
             $st = Update-ShrinkStuckState -State $stuckState[$s.Spid] -Blocker $row.Blocker -Cpu $row.Cpu -Reads $row.Reads -Now (Get-Date) -WindowSec $StuckWindowSeconds
             if ($st.IsStuck -and $s.Command) {
-                Write-ShrinkLog ("worker {0} session ID {1} stuck on blocker {2} >= {3}s with no progress: cancelling command." -f $workerId, $s.Spid, $row.Blocker, $StuckWindowSeconds) 'WARN'
+                $why = if ($st.BlockerStuck -and $row.Blocker) { "blocked by session $($row.Blocker)" } else { 'no CPU or read progress' }
+                Write-ShrinkLog ("worker {0} session ID {1} stuck ({2}) for >= {3}s: cancelling command." -f $workerId, $s.Spid, $why, $StuckWindowSeconds) 'WARN'
                 try { $s.Command.Cancel() } catch {}
-                $stuckState[$s.Spid].StuckSince = $null
+                $stuckState[$s.Spid].BlockerSince = $null
+                $stuckState[$s.Spid].NoProgressSince = $null
             }
         }
         # Render the collected worker rows as one aligned table, using a single size unit chosen from
@@ -730,16 +797,18 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 $usedHdr  = $(if ($null -ne $d.UsedMB) { $numFmt -f ([double]$d.UsedMB / $unit.PerMB) } else { '' })
                 $allocHdr = $(if ($null -ne $d.AllocMB) { $numFmt -f ([double]$d.AllocMB / $unit.PerMB) } else { '' })
                 '%Done'   = $(if ($null -ne $d.Pct) { [string]$d.Pct } else { '' })
-                Elapsed   = $(if ($null -ne $d.ElapsedS) { '{0}s' -f $d.ElapsedS } else { '' })
+                Elapsed   = $(if ($null -ne $d.ElapsedS) { Format-ShrinkDuration -TimeSpan ([TimeSpan]::FromSeconds($d.ElapsedS)) } else { '' })
+                Increment = [string]$d.Increment
                 Cmd       = [string]$d.Cmd
                 Status    = [string]$d.Status
                 dCPU      = [string]$d.DCpu
                 dReads    = [string]$d.DReads
+                dWrites   = [string]$d.DWrites
                 Blocker   = $(if ($d.Blocker) { [string]$d.Blocker } else { '-' })
                 Wait      = [string]$d.Wait
             }
         }
-        Format-ShrinkTable -Rows @($statusTable) -RightAlign @('Worker', 'SPID', 'File', $usedHdr, $allocHdr, '%Done', 'Elapsed', 'dCPU', 'dReads') |
+        Format-ShrinkTable -Rows @($statusTable) -RightAlign @('Worker', 'SPID', 'File', $usedHdr, $allocHdr, '%Done', 'Elapsed', 'Increment', 'dCPU', 'dReads', 'dWrites') |
             ForEach-Object { Write-ShrinkLog $_ }
         $tot = Get-ShrinkDatabaseTotals -Conn $control
         $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
@@ -770,7 +839,17 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             $evt = ''
             while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
             if ((Get-Date) -ge $nextReport) {
-                Write-StatusReport
+                # The status report reads through the control connection; if the server dropped it
+                # (e.g. a restart), reopen it and skip just this report rather than failing the run.
+                try {
+                    if ($control.State -ne 'Open') { try { $control.Dispose() } catch {}; $control = (New-ShrinkConnection).Connection }
+                    Write-StatusReport
+                }
+                catch {
+                    Write-ShrinkLog ("Status report skipped (control connection issue): {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN'
+                    try { $control.Dispose() } catch {}
+                    try { $control = (New-ShrinkConnection).Connection } catch { Write-ShrinkLog ("Control reconnect failed; will retry at the next report: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
+                }
                 $nextReport = (Get-Date).AddSeconds($StatusIntervalSeconds)
             }
             if (-not ($workers | Where-Object { -not $_.Handle.IsCompleted })) { Write-ShrinkLog 'All workers finished.'; break }
@@ -792,14 +871,20 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         $evt = ''
         while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
         $elapsed = Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime)
-        $tot = Get-ShrinkDatabaseTotals -Conn $control
-        $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
+        # The final totals need a live control connection; if the server dropped it (e.g. a restart),
+        # try once to reopen, but never let that stop us from writing the outcome summary.
+        $dbUsedMb = $null; $dbAllocMb = $null
+        try {
+            if ($control.State -ne 'Open') { try { $control.Dispose() } catch {}; $control = (New-ShrinkConnection).Connection }
+            $tot = Get-ShrinkDatabaseTotals -Conn $control
+            $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
+        } catch { Write-ShrinkLog ("Could not read final database totals: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
         $c = Get-ShrinkBucketCounts -Buckets @($shared.Completed.Values | ForEach-Object { $_.Bucket })
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
                 'Elapsed'            = $elapsed
-                'Used'               = (Format-ShrinkSize $dbUsedMb)
-                'Allocated'          = (Format-ShrinkSize $dbAllocMb)
+                'Used'               = $(if ($null -ne $dbUsedMb) { Format-ShrinkSize $dbUsedMb } else { '(unavailable)' })
+                'Allocated'          = $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' })
                 'Shrunk'             = $c.Shrunk
                 'Repacked'           = $c.Repacked
                 'Partly shrunk'      = $c.PartlyShrunk
@@ -810,7 +895,8 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             }) | ForEach-Object { Write-ShrinkLog $_ }
         foreach ($r in $shared.Completed.GetEnumerator()) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
         Write-ShrinkLog '-------------------------------------------------'
-        $control.Close(); $control.Dispose()
+        try { $control.Close() } catch {}
+        try { $control.Dispose() } catch {}
     }
     }
     catch {
@@ -820,6 +906,30 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
 }
 
 # ----- internal helper functions (used by Invoke-ShrinkDriver and the worker runspaces) -----
+
+function New-ShrinkRetryProvider {
+    <# .SYNOPSIS
+      Build a Microsoft.Data.SqlClient connection-retry provider (exponential backoff with jitter)
+      for transient connection-open failures, such as an Azure SQL restart or failover. This is a
+      short, shallow inner retry that only smooths reopening; the caller's own retry loop remains
+      the outer backstop for errors this provider's transient list does not cover. Returns $null
+      when the driver predates configurable retry (Microsoft.Data.SqlClient earlier than 3.0). #>
+    [CmdletBinding()]
+    param(
+        [int]$NumberOfTries = 5,
+        [int]$DeltaSeconds = 4,
+        [int]$MaxIntervalSeconds = 30
+    )
+    if (-not ('Microsoft.Data.SqlClient.SqlConfigurableRetryFactory' -as [type])) { return $null }
+    $opt = [Microsoft.Data.SqlClient.SqlRetryLogicOption]::new()
+    $opt.NumberOfTries = $NumberOfTries
+    $opt.DeltaTime = [TimeSpan]::FromSeconds($DeltaSeconds)
+    $opt.MaxTimeInterval = [TimeSpan]::FromSeconds($MaxIntervalSeconds)
+    # Leave TransientErrors unset so the provider uses the driver's own maintained default list of
+    # transient error numbers (Azure SQL restart/failover/throttling and transport drops). Our own
+    # retry loop is a broad catch-all backstop for anything the default list happens to omit.
+    [Microsoft.Data.SqlClient.SqlConfigurableRetryFactory]::CreateExponentialRetryProvider($opt)
+}
 
 function Format-ShrinkSize {
     <# .SYNOPSIS Format a size given in MiB using an auto-selected binary unit (KiB, MiB, GiB, or TiB). #>
@@ -1147,7 +1257,8 @@ function Get-ShrinkDeltaWithReset {
 }
 
 function Update-ShrinkStuckState {
-    <# .SYNOPSIS Update per-session stuck state; stuck = same non-zero blocker >= WindowSec with no CPU/reads progress. #>
+    <# .SYNOPSIS Update per-session stuck state. A worker is stuck when, for at least WindowSec, EITHER
+       the same non-zero blocking session has persisted, OR neither CPU nor reads have advanced. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][hashtable]$State,
@@ -1157,21 +1268,28 @@ function Update-ShrinkStuckState {
         [datetime]$Now = (Get-Date),
         [int]$WindowSec = 300
     )
-    $isStuck = $false
+    # Blocker streak: how long the same non-zero blocking session has persisted. Cleared when there is
+    # no blocker; restarted when the blocking session changes.
     if (-not $Blocker) {
-        $State.StuckSince = $null
+        $State.BlockerSince = $null
     }
-    elseif ($State.Blocker -eq $Blocker -and $State.Cpu -eq $Cpu -and $State.Reads -eq $Reads) {
-        if ($null -eq $State.StuckSince) { $State.StuckSince = $Now }
-        elseif (($Now - [datetime]$State.StuckSince).TotalSeconds -ge $WindowSec) { $isStuck = $true }
+    elseif ($State.Blocker -ne $Blocker -or $null -eq $State.BlockerSince) {
+        $State.BlockerSince = $Now
     }
-    else {
-        $State.StuckSince = $Now
+    # No-progress streak: how long neither CPU nor reads have changed. Any change - including a
+    # per-request counter reset, which signals a new step - counts as progress and restarts the streak.
+    if ($State.Cpu -ne $Cpu -or $State.Reads -ne $Reads -or $null -eq $State.NoProgressSince) {
+        $State.NoProgressSince = $Now
     }
+
+    $blockerStuck = ($null -ne $State.BlockerSince) -and (($Now - [datetime]$State.BlockerSince).TotalSeconds -ge $WindowSec)
+    $noProgressStuck = ($null -ne $State.NoProgressSince) -and (($Now - [datetime]$State.NoProgressSince).TotalSeconds -ge $WindowSec)
+    $isStuck = [bool]($blockerStuck -or $noProgressStuck)
+
     $State.Blocker = $Blocker
     $State.Cpu = $Cpu
     $State.Reads = $Reads
-    [pscustomobject]@{ IsStuck = $isStuck; StuckSince = $State.StuckSince }
+    [pscustomobject]@{ IsStuck = $isStuck; BlockerStuck = [bool]$blockerStuck; NoProgressStuck = [bool]$noProgressStuck }
 }
 
 function New-ShrinkCommandText {

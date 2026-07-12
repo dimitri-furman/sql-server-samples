@@ -345,27 +345,52 @@ Describe 'Get-ShrinkDeltaWithReset' {
 }
 
 Describe 'Update-ShrinkStuckState' {
-    It 'fires only after the window with the same blocker and no progress' {
-        $state = @{ Blocker=$null; Cpu=0; Reads=0; StuckSince=$null }
+    It 'fires when the same non-zero blocker persists for the window, even while CPU advances' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
         $t0 = Get-Date
         (Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0 -WindowSec 300).IsStuck | Should -BeFalse
-        (Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0.AddSeconds(310) -WindowSec 300).IsStuck | Should -BeTrue
+        (Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 999 -Reads 999 -Now $t0.AddSeconds(310) -WindowSec 300).IsStuck | Should -BeTrue
     }
-    It 'does not fire if CPU or reads increased' {
-        $state = @{ Blocker=$null; Cpu=0; Reads=0; StuckSince=$null }
+    It 'fires when neither CPU nor reads advance for the window, with no blocker' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
         $t0 = Get-Date
-        Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0 | Out-Null
-        (Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 20 -Reads 10 -Now $t0.AddSeconds(400)).IsStuck | Should -BeFalse
+        (Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 10 -Reads 10 -Now $t0 -WindowSec 300).IsStuck | Should -BeFalse
+        (Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 10 -Reads 10 -Now $t0.AddSeconds(310) -WindowSec 300).IsStuck | Should -BeTrue
     }
-    It 'does not fire if the blocker changes' {
-        $state = @{ Blocker=$null; Cpu=0; Reads=0; StuckSince=$null }
+    It 'does not fire while CPU or reads keep advancing and there is no blocker' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
         $t0 = Get-Date
-        Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0 | Out-Null
-        (Update-ShrinkStuckState -State $state -Blocker 77 -Cpu 10 -Reads 10 -Now $t0.AddSeconds(400)).IsStuck | Should -BeFalse
+        Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 10 -Reads 10 -Now $t0 -WindowSec 300 | Out-Null
+        (Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 20 -Reads 30 -Now $t0.AddSeconds(400) -WindowSec 300).IsStuck | Should -BeFalse
     }
-    It 'does not fire when not blocked' {
-        $state = @{ Blocker=$null; Cpu=0; Reads=0; StuckSince=$null }
-        (Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 10 -Reads 10 -Now (Get-Date)).IsStuck | Should -BeFalse
+    It 'treats a per-request counter reset as progress' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
+        $t0 = Get-Date
+        Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 500 -Reads 500 -Now $t0 -WindowSec 300 | Out-Null
+        (Update-ShrinkStuckState -State $state -Blocker 0 -Cpu 5 -Reads 5 -Now $t0.AddSeconds(310) -WindowSec 300).IsStuck | Should -BeFalse
+    }
+    It 'restarts the blocker streak when the blocker changes' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
+        $t0 = Get-Date
+        Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0 -WindowSec 300 | Out-Null
+        (Update-ShrinkStuckState -State $state -Blocker 77 -Cpu 20 -Reads 20 -Now $t0.AddSeconds(400) -WindowSec 300).IsStuck | Should -BeFalse
+    }
+    It 'does not fire within the window' {
+        $state = @{ Blocker=$null; Cpu=0; Reads=0; BlockerSince=$null; NoProgressSince=$null }
+        $t0 = Get-Date
+        Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0 -WindowSec 300 | Out-Null
+        (Update-ShrinkStuckState -State $state -Blocker 55 -Cpu 10 -Reads 10 -Now $t0.AddSeconds(120) -WindowSec 300).IsStuck | Should -BeFalse
+    }
+}
+
+Describe 'New-ShrinkRetryProvider' {
+    It 'returns a provider when configurable retry is available, otherwise null, without throwing' {
+        $provider = New-ShrinkRetryProvider
+        if ('Microsoft.Data.SqlClient.SqlConfigurableRetryFactory' -as [type]) {
+            $provider | Should -Not -BeNullOrEmpty
+        } else {
+            $provider | Should -BeNullOrEmpty
+        }
     }
 }
 
