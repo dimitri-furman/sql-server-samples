@@ -274,10 +274,12 @@ function Invoke-ShrinkDriver {
             }
         }
     }
-    function Invoke-ShrinkScalar {
-        param([Microsoft.Data.SqlClient.SqlConnection]$Conn, [string]$Sql, [int]$TimeoutSec = 30)
-        $cmd = $Conn.CreateCommand(); $cmd.CommandText = $Sql; $cmd.CommandTimeout = $TimeoutSec
-        try { $cmd.ExecuteScalar() } finally { $cmd.Dispose() }
+    function Get-ShrinkLiveControl {
+        # Return a live control connection, reopening it if the server dropped it (e.g. a restart).
+        param($Conn)
+        if ($Conn -and $Conn.State -eq 'Open') { return $Conn }
+        if ($Conn) { try { $Conn.Dispose() } catch {} }
+        (New-ShrinkConnection).Connection
     }
 
     # ----- pre-flight -----
@@ -294,8 +296,7 @@ SELECT df.file_id, df.name,
        CAST(FILEPROPERTY(df.name, 'SpaceUsed') / 128.0 AS bigint) AS used_mb
 FROM sys.database_files df
 JOIN sys.filegroups fg ON df.data_space_id = fg.data_space_id
-WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0 AND df.is_read_only = 0
-ORDER BY (df.size - CAST(FILEPROPERTY(df.name, 'SpaceUsed') AS bigint)) DESC;
+WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0 AND df.is_read_only = 0;
 '@
         $cmd = $Conn.CreateCommand(); $cmd.CommandText = $sql; $cmd.CommandTimeout = 120
         $rd = $cmd.ExecuteReader()
@@ -356,11 +357,11 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
         Write-ShrinkLog '-------------------- shrink potential report --------------------'
         Format-ShrinkFileReport -Files $report -TopN 100 | ForEach-Object { Write-ShrinkLog $_ }
         $eligibleFiles = @($report | Where-Object { $_.IsEligible })
-        $sumUsed = [long](($report | Measure-Object UsedMB -Sum).Sum)
-        $sumAlloc = [long](($report | Measure-Object AllocatedMB -Sum).Sum)
+        $sumUsed = Get-ShrinkSumMB -Items $report -Property UsedMB
+        $sumAlloc = Get-ShrinkSumMB -Items $report -Property AllocatedMB
         # Report only the space a shrink with these settings would actually reclaim (the eligible
         # files); files below the threshold are left as-is, so they don't count toward the total.
-        $sumRecl = [long](($eligibleFiles | Measure-Object ReclaimableMB -Sum).Sum)
+        $sumRecl = Get-ShrinkSumMB -Items $eligibleFiles -Property ReclaimableMB
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
                 'Data files'             = $report.Count
@@ -374,22 +375,32 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
         $control.Close(); return
     }
 
-    # Supported platforms only: SQL Server 2022 or later, Azure SQL Database, and
-    # Azure SQL Managed Instance.
-    $engineEdition = [int](Invoke-ShrinkScalar $control "SELECT CAST(SERVERPROPERTY('EngineEdition') AS int);")
-    $majorVersion = [int](Invoke-ShrinkScalar $control "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int);")
-    $isAzureDbOrMi = $engineEdition -in @(5, 8)
-    if (-not $isAzureDbOrMi -and $majorVersion -lt 16) {
+    # Supported platforms only: SQL Server 2022 or later, Azure SQL Database, and Azure SQL Managed
+    # Instance. Read version, edition, permission, AUTO_SHRINK, and read-only checks in one round trip.
+    $pfCmd = $control.CreateCommand(); $pfCmd.CommandTimeout = 30
+    $pfCmd.CommandText = @'
+SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
+       CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major_version,
+       CASE WHEN IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1 THEN 1 ELSE 0 END AS has_perm,
+       CAST(DATABASEPROPERTYEX(DB_NAME(), 'IsAutoShrink') AS int) AS auto_shrink,
+       CASE WHEN DATABASEPROPERTYEX(DB_NAME(), 'Updateability') = 'READ_ONLY' THEN 1 ELSE 0 END AS read_only;
+'@
+    $pfRd = $pfCmd.ExecuteReader()
+    try {
+        [void]$pfRd.Read()
+        $engineEdition = [int]$pfRd['engine_edition']
+        $majorVersion = [int]$pfRd['major_version']
+        $hasPerm = [int]$pfRd['has_perm']
+        $autoShrink = [int]$pfRd['auto_shrink']
+        $dbReadOnly = [int]$pfRd['read_only']
+    } finally { $pfRd.Dispose(); $pfCmd.Dispose() }
+    if (-not ($engineEdition -in @(5, 8)) -and $majorVersion -lt 16) {
         throw "ShrinkDriver supports only SQL Server 2022 or later, Azure SQL Database, and Azure SQL Managed Instance. Detected major version $majorVersion (EngineEdition $engineEdition), which is not supported."
     }
-    $hasPerm = [int](Invoke-ShrinkScalar $control "SELECT CASE WHEN IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1 THEN 1 ELSE 0 END;")
     if ($hasPerm -ne 1) { throw "The login must be a member of db_owner on [$DatabaseName] or sysadmin." }
-    $autoShrink = [int](Invoke-ShrinkScalar $control "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'IsAutoShrink') AS int);")
     if ($autoShrink -eq 1) {
         throw "AUTO_SHRINK is ON for [$DatabaseName]. Disable it (ALTER DATABASE ... SET AUTO_SHRINK OFF) before running ShrinkDriver."
     }
-    # Fail fast on read-only databases
-    $dbReadOnly = [int](Invoke-ShrinkScalar $control "SELECT CASE WHEN DATABASEPROPERTYEX(DB_NAME(), 'Updateability') = 'READ_ONLY' THEN 1 ELSE 0 END;")
     if ($dbReadOnly -eq 1) {
         throw "Database [$DatabaseName] is read-only; its files cannot be shrunk."
     }
@@ -769,8 +780,7 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
             $inList = ($spids -join ',')
             $sql = @"
 SELECT r.session_id, r.status, r.command, ISNULL(r.wait_type,'') AS wait_type, r.wait_time,
-       ISNULL(r.wait_resource,'') AS wait_resource, r.percent_complete, r.total_elapsed_time,
-       r.cpu_time, r.reads, r.writes, ISNULL(r.blocking_session_id,0) AS blocker,
+       r.percent_complete, r.cpu_time, r.reads, r.writes, ISNULL(r.blocking_session_id,0) AS blocker,
        ISNULL((SELECT TOP 1 b.command FROM sys.dm_exec_requests b WHERE b.session_id = r.blocking_session_id),'') AS blocker_cmd
 FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
 "@
@@ -778,8 +788,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             $rd = $cmd.ExecuteReader()
             try { while ($rd.Read()) { $rows.Add([pscustomobject]@{
                             Spid = [int]$rd['session_id']; Status = [string]$rd['status']; Command = [string]$rd['command']
-                            Wait = [string]$rd['wait_type']; WaitTime = [long]$rd['wait_time']; WaitRes = [string]$rd['wait_resource']
-                            Pct = [double]$rd['percent_complete']; Elapsed = [long]$rd['total_elapsed_time']
+                            Wait = [string]$rd['wait_type']; WaitTime = [long]$rd['wait_time']; Pct = [double]$rd['percent_complete']
                             Cpu = [long]$rd['cpu_time']; Reads = [long]$rd['reads']; Writes = [long]$rd['writes']; Blocker = [int]$rd['blocker']; BlockerCmd = [string]$rd['blocker_cmd']
                         }) } } finally { $rd.Dispose(); $cmd.Dispose() }
         }
@@ -868,18 +877,10 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         try { $buckets = @($shared.Completed.Values | ForEach-Object { $_.Bucket }) } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
         $c = Get-ShrinkBucketCounts -Buckets $buckets
         Write-ShrinkLog '---- database total ----'
-        Format-ShrinkKeyValueTable -Rows ([ordered]@{
-                'Run time'           = (Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime))
-                'Used'               = (Format-ShrinkSize $dbUsedMb)
-                'Allocated'          = (Format-ShrinkSize $dbAllocMb)
-                'Shrunk'             = $c.Shrunk
-                'Repacked'           = $c.Repacked
-                'Partly shrunk'      = $c.PartlyShrunk
-                'Already at minimum' = $c.AlreadyMinimal
-                'Already at target'  = $c.AlreadyAtTarget
-                'Grew'               = $c.Grew
-                'Gave up'            = $c.GaveUp
-            }) | ForEach-Object { Write-ShrinkLog $_ }
+        Format-ShrinkKeyValueTable -Rows (Get-ShrinkTotalsRows `
+                -RunTime (Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime)) `
+                -Used (Format-ShrinkSize $dbUsedMb) -Allocated (Format-ShrinkSize $dbAllocMb) -Counts $c) |
+            ForEach-Object { Write-ShrinkLog $_ }
     }
 
     # Poll frequently so worker events (connects, file starts, retries, give-ups) surface
@@ -906,13 +907,12 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 # The status report reads through the control connection; if the server dropped it
                 # (e.g. a restart), reopen it and skip just this report rather than failing the run.
                 try {
-                    if ($control.State -ne 'Open') { try { $control.Dispose() } catch {}; $control = (New-ShrinkConnection).Connection }
+                    $control = Get-ShrinkLiveControl $control
                     Write-StatusReport
                 }
                 catch {
                     Write-ShrinkLog ("Status report skipped (control connection issue): {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN'
-                    try { $control.Dispose() } catch {}
-                    try { $control = (New-ShrinkConnection).Connection } catch { Write-ShrinkLog ("Control reconnect failed; will retry at the next report: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
+                    try { $control = Get-ShrinkLiveControl $control } catch { Write-ShrinkLog ("Control reconnect failed; will retry at the next report: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
                 }
                 $nextReport = (Get-Date).AddSeconds($StatusIntervalSeconds)
             }
@@ -939,24 +939,16 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         # try once to reopen, but never let that stop us from writing the outcome summary.
         $dbUsedMb = $null; $dbAllocMb = $null
         try {
-            if ($control.State -ne 'Open') { try { $control.Dispose() } catch {}; $control = (New-ShrinkConnection).Connection }
+            $control = Get-ShrinkLiveControl $control
             $tot = Get-ShrinkDatabaseTotals -Conn $control
             $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
         } catch { Write-ShrinkLog ("Could not read final database totals: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
         $c = Get-ShrinkBucketCounts -Buckets @($shared.Completed.Values | ForEach-Object { $_.Bucket })
         Write-ShrinkLog '-------------------- summary --------------------'
-        Format-ShrinkKeyValueTable -Rows ([ordered]@{
-                'Run time'           = $elapsed
-                'Used'               = $(if ($null -ne $dbUsedMb) { Format-ShrinkSize $dbUsedMb } else { '(unavailable)' })
-                'Allocated'          = $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' })
-                'Shrunk'             = $c.Shrunk
-                'Repacked'           = $c.Repacked
-                'Partly shrunk'      = $c.PartlyShrunk
-                'Already at minimum' = $c.AlreadyMinimal
-                'Already at target'  = $c.AlreadyAtTarget
-                'Grew'               = $c.Grew
-                'Gave up'            = $c.GaveUp
-            }) | ForEach-Object { Write-ShrinkLog $_ }
+        Format-ShrinkKeyValueTable -Rows (Get-ShrinkTotalsRows -RunTime $elapsed `
+                -Used $(if ($null -ne $dbUsedMb) { Format-ShrinkSize $dbUsedMb } else { '(unavailable)' }) `
+                -Allocated $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' }) -Counts $c) |
+            ForEach-Object { Write-ShrinkLog $_ }
         foreach ($r in $shared.Completed.GetEnumerator()) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
         Write-ShrinkLog '-------------------------------------------------'
         try { $control.Close() } catch {}
@@ -1106,33 +1098,44 @@ function Format-ShrinkFileReport {
     $reclHdr = "Reclaimable ($($unit.Name))"
 
     $rows = foreach ($f in $shown) {
-        [pscustomobject]@{
-            File        = [string]$f.FileId
-            Name        = [string]$f.Name
-            Used        = ($numFmt -f ([double]$f.UsedMB / $unit.PerMB))
-            Allocated   = ($numFmt -f ([double]$f.AllocatedMB / $unit.PerMB))
-            Reclaimable = ($numFmt -f ([double]$f.ReclaimableMB / $unit.PerMB))
-            Eligible    = if ($f.IsEligible) { 'Yes' } else { 'No' }
+        [ordered]@{
+            File      = [string]$f.FileId
+            Name      = [string]$f.Name
+            $usedHdr  = ($numFmt -f ([double]$f.UsedMB / $unit.PerMB))
+            $allocHdr = ($numFmt -f ([double]$f.AllocatedMB / $unit.PerMB))
+            $reclHdr  = ($numFmt -f ([double]$f.ReclaimableMB / $unit.PerMB))
+            Eligible  = if ($f.IsEligible) { 'Yes' } else { 'No' }
         }
     }
-    $rows = @($rows)
-    $wFile = (@('File') + $rows.File | Measure-Object -Property Length -Maximum).Maximum
-    $wName = (@('Name') + $rows.Name | Measure-Object -Property Length -Maximum).Maximum
-    $wUsed = (@($usedHdr) + $rows.Used | Measure-Object -Property Length -Maximum).Maximum
-    $wAlloc = (@($allocHdr) + $rows.Allocated | Measure-Object -Property Length -Maximum).Maximum
-    $wRecl = (@($reclHdr) + $rows.Reclaimable | Measure-Object -Property Length -Maximum).Maximum
-    $wElig = (@('Eligible') + $rows.Eligible | Measure-Object -Property Length -Maximum).Maximum
-    $fmt = "{0,$wFile}  {1,-$wName}  {2,$wUsed}  {3,$wAlloc}  {4,$wRecl}  {5,$wElig}"
-
     $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add(($fmt -f 'File', 'Name', $usedHdr, $allocHdr, $reclHdr, 'Eligible'))
-    $lines.Add(($fmt -f ('-' * $wFile), ('-' * $wName), ('-' * $wUsed), ('-' * $wAlloc), ('-' * $wRecl), ('-' * $wElig)))
-    foreach ($r in $rows) { $lines.Add(($fmt -f $r.File, $r.Name, $r.Used, $r.Allocated, $r.Reclaimable, $r.Eligible)) }
+    Format-ShrinkTable -Rows @($rows) -RightAlign @('File', $usedHdr, $allocHdr, $reclHdr) |
+        ForEach-Object { $lines.Add($_) }
     $omitted = $sorted.Count - $shown.Count
     if ($omitted -gt 0) {
         $lines.Add(("... {0} other file(s) omitted; showing the top {1} by reclaimable space." -f $omitted, $TopN))
     }
     $lines.ToArray()
+}
+
+function Get-ShrinkSumMB {
+    <# .SYNOPSIS Sum a numeric property over a (possibly empty) set of items, returning 0 when empty. #>
+    [CmdletBinding()][OutputType([long])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory)][string]$Property
+    )
+    $m = $Items | Measure-Object -Property $Property -Sum
+    [long]$(if ($m) { $m.Sum } else { 0 })
+}
+
+function Get-ShrinkEffectiveFloorMB {
+    <# .SYNOPSIS The size (MiB) a file will not shrink below: the larger of its used pages and any target floor. #>
+    [CmdletBinding()][OutputType([long])]
+    param(
+        [Parameter(Mandatory)][long]$UsedMB,
+        [Nullable[long]]$FloorMB = $null
+    )
+    [Math]::Max($UsedMB, $(if ($null -ne $FloorMB) { [long]$FloorMB } else { [long]0 }))
 }
 
 function Test-ShrinkWorthwhile {
@@ -1147,8 +1150,7 @@ function Test-ShrinkWorthwhile {
         [long]$MinReclaimMB = 100
     )
     if ($AllocatedMB -le 0) { return $false }
-    $effFloor = [Math]::Max($UsedMB, $(if ($null -ne $FloorMB) { [long]$FloorMB } else { [long]0 }))
-    ($AllocatedMB - $effFloor) -ge $MinReclaimMB
+    ($AllocatedMB - (Get-ShrinkEffectiveFloorMB -UsedMB $UsedMB -FloorMB $FloorMB)) -ge $MinReclaimMB
 }
 
 function Get-ShrinkReclaimableMB {
@@ -1161,8 +1163,7 @@ function Get-ShrinkReclaimableMB {
         [Parameter(Mandatory)][long]$UsedMB,
         [Nullable[long]]$FloorMB = $null
     )
-    $effFloor = [Math]::Max($UsedMB, $(if ($null -ne $FloorMB) { [long]$FloorMB } else { [long]0 }))
-    [long][Math]::Max(0, $AllocatedMB - $effFloor)
+    [long][Math]::Max(0, $AllocatedMB - (Get-ShrinkEffectiveFloorMB -UsedMB $UsedMB -FloorMB $FloorMB))
 }
 
 function Get-ShrinkBucketCounts {
@@ -1177,6 +1178,29 @@ function Get-ShrinkBucketCounts {
         AlreadyAtTarget = @($Buckets | Where-Object { $_ -eq 'AlreadyAtTarget' }).Count
         Grew            = @($Buckets | Where-Object { $_ -eq 'Grew' }).Count
         GaveUp          = @($Buckets | Where-Object { $_ -eq 'GaveUp' }).Count
+    }
+}
+
+function Get-ShrinkTotalsRows {
+    <# .SYNOPSIS Build the ordered label/value rows shared by the database-total and final-summary tables. #>
+    [CmdletBinding()][OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)][string]$RunTime,
+        [Parameter(Mandatory)][string]$Used,
+        [Parameter(Mandatory)][string]$Allocated,
+        [Parameter(Mandatory)][pscustomobject]$Counts
+    )
+    [ordered]@{
+        'Run time'           = $RunTime
+        'Used'               = $Used
+        'Allocated'          = $Allocated
+        'Shrunk'             = $Counts.Shrunk
+        'Repacked'           = $Counts.Repacked
+        'Partly shrunk'      = $Counts.PartlyShrunk
+        'Already at minimum' = $Counts.AlreadyMinimal
+        'Already at target'  = $Counts.AlreadyAtTarget
+        'Grew'               = $Counts.Grew
+        'Gave up'            = $Counts.GaveUp
     }
 }
 

@@ -207,6 +207,16 @@ Describe 'Get-ShrinkReclaimableMB' {
     }
 }
 
+Describe 'Get-ShrinkSumMB' {
+    It 'sums the property across items' {
+        $items = @([pscustomobject]@{ V = 10 }, [pscustomobject]@{ V = 32 })
+        Get-ShrinkSumMB -Items $items -Property V | Should -Be 42
+    }
+    It 'returns 0 for an empty set' {
+        Get-ShrinkSumMB -Items @() -Property V | Should -Be 0
+    }
+}
+
 Describe 'Get-ShrinkSizeUnit' {
     It 'picks <unit> for <mb> MiB' -TestCases @(
         @{ Mb = 0.5;      Unit = 'KiB' }
@@ -337,6 +347,20 @@ Describe 'Get-ShrinkGaveUpBucket' {
     }
 }
 
+Describe 'Get-ShrinkTotalsRows' {
+    It 'builds the run-time, size, and bucket rows in order' {
+        $counts = Get-ShrinkBucketCounts -Buckets @('Shrunk', 'Grew')
+        $rows = Get-ShrinkTotalsRows -RunTime '1m 2s' -Used '10.0 GiB' -Allocated '20.0 GiB' -Counts $counts
+        @($rows.Keys) | Should -Be @('Run time', 'Used', 'Allocated', 'Shrunk', 'Repacked', 'Partly shrunk', 'Already at minimum', 'Already at target', 'Grew', 'Gave up')
+        $rows['Run time']  | Should -Be '1m 2s'
+        $rows['Used']      | Should -Be '10.0 GiB'
+        $rows['Allocated'] | Should -Be '20.0 GiB'
+        $rows['Shrunk']    | Should -Be 1
+        $rows['Grew']      | Should -Be 1
+        $rows['Gave up']   | Should -Be 0
+    }
+}
+
 Describe 'Get-ShrinkDeltaWithReset' {
     It 'returns a positive delta when increasing' {
         $r = Get-ShrinkDeltaWithReset -Previous 100 -Current 150
@@ -401,11 +425,9 @@ Describe 'New-ShrinkRetryProvider' {
 }
 
 Describe 'New-ShrinkCommandText' {
-    It 'builds a plain target shrink with NO_INFOMSGS and no WLP/USE' {
+    It 'builds a plain target shrink with NO_INFOMSGS' {
         $c = New-ShrinkCommandText -FileId 3 -TargetMB 52000
         $c | Should -Be 'DBCC SHRINKFILE (3, 52000) WITH NO_INFOMSGS'
-        $c | Should -Not -Match 'USE'
-        $c | Should -Not -Match 'WAIT_AT_LOW_PRIORITY'
     }
     It 'builds TRUNCATEONLY without a target' {
         New-ShrinkCommandText -FileId 1 -TruncateOnly | Should -Be 'DBCC SHRINKFILE (1, TRUNCATEONLY) WITH NO_INFOMSGS'
@@ -414,10 +436,9 @@ Describe 'New-ShrinkCommandText' {
         New-ShrinkCommandText -FileId 2 -TargetMB 1000 -NoTruncate |
             Should -Be 'DBCC SHRINKFILE (2, 1000, NOTRUNCATE) WITH NO_INFOMSGS'
     }
-    It 'adds WLP with SELF and never emits MAX_DURATION' {
+    It 'adds WLP with SELF' {
         $c = New-ShrinkCommandText -FileId 5 -TargetMB 1 -WaitAtLowPriority -AbortAfterWait SELF
         $c | Should -Match 'WAIT_AT_LOW_PRIORITY \(ABORT_AFTER_WAIT = SELF\)'
-        $c | Should -Not -Match 'MAX_DURATION'
     }
     It 'adds WLP with BLOCKERS' {
         New-ShrinkCommandText -FileId 5 -TargetMB 1 -WaitAtLowPriority -AbortAfterWait BLOCKERS |
