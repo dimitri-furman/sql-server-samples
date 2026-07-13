@@ -218,6 +218,7 @@ function Invoke-ShrinkDriver {
     }
 
     # Log any terminating error to the file before it propagates to the console.
+    $control = $null
     try {
 
     # ----- connection helpers -----
@@ -234,6 +235,10 @@ function Invoke-ShrinkDriver {
         $csb = [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new()
         $csb['Data Source'] = $ServerName; $csb['Initial Catalog'] = $DatabaseName
         $csb['Encrypt'] = $true; $csb['Connect Timeout'] = 30; $csb['Application Name'] = 'ShrinkDriver'
+        # This tool holds a few long-lived connections, so pooling gives no benefit and would keep the
+        # physical connection (and its server session) open after Dispose, to be handed back to a later
+        # run. Turn pooling off so Close/Dispose actually closes the connection when we are done.
+        $csb['Pooling'] = $false
         # A connection-level retry provider rides out transient open failures (for example an Azure
         # SQL restart or failover). It is a shallow inner retry; callers keep their own retry loop.
         $retry = New-ShrinkRetryProvider
@@ -412,7 +417,12 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
     # value records which bucket it landed in (Shrunk, PartlyShrunk, AlreadyMinimal,
     # AlreadyAtTarget, Grew, or GaveUp) plus an optional reason. Files listed here are
     # never selected again.
-    $shared.Owned = @{}; $shared.Completed = @{}; $shared.Sessions = @{}
+    $shared.Owned = @{}; $shared.Completed = @{}
+    # Sessions is read by the monitor thread and written by every worker (at startup and on each state
+    # change), so it must be thread-safe. A plain hashtable corrupts under concurrent writes, which can
+    # drop a worker's entry and make it throw (and die) before it ever starts a file. Owned/Completed
+    # stay plain hashtables because every access to them is already serialized by $shared.Lock.
+    $shared.Sessions = [System.Collections.Concurrent.ConcurrentDictionary[int, object]]::new()
     $shared.Events = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
     $shared.Stop = $false; $shared.Lock = [object]::new()
 
@@ -434,6 +444,7 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
             $csb = [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new()
             $csb['Data Source'] = $connParams.Server; $csb['Initial Catalog'] = $connParams.Database
             $csb['Encrypt'] = $true; $csb['Connect Timeout'] = 30; $csb['Application Name'] = "ShrinkDriver-w$workerId"
+            $csb['Pooling'] = $false   # dedicated, long-lived connection; close it for real on Dispose
             $c = [Microsoft.Data.SqlClient.SqlConnection]::new()
             switch ($connParams.AuthType) {
                 'Windows' { $csb['Integrated Security'] = $true; $c.ConnectionString = $csb.ConnectionString }
@@ -469,7 +480,15 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                 try {
                     $newConn = New-WConn
                     $spidCmd = $newConn.CreateCommand(); $spidCmd.CommandText = 'SELECT @@SPID'
-                    $shared.Sessions[$workerId].Spid = [int]$spidCmd.ExecuteScalar(); $spidCmd.Dispose()
+                    $newSpid = [int]$spidCmd.ExecuteScalar(); $spidCmd.Dispose()
+                    # Publish the new session id (a reconnect gets a fresh one) and mark the worker
+                    # live again so the status report tracks the right session. Reset ConnectTime too,
+                    # so the worker's Elapsed reflects its current connection; the run-wide elapsed is
+                    # shown separately in the database-total section.
+                    $shared.Sessions[$workerId].Spid = $newSpid
+                    $shared.Sessions[$workerId].State = 'Shrinking'
+                    $shared.Sessions[$workerId].ConnectTime = (Get-Date)
+                    Emit "reconnected on attempt $try (session ID $newSpid)"
                     return $newConn
                 }
                 catch {
@@ -511,7 +530,13 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                     $sz = $null
                     try { $sz = Get-Size $conn $file.FileId }
                     catch [Microsoft.Data.SqlClient.SqlException] {
+                        if ($shared.Stop) { break }
                         # The server dropped the connection between shrink steps; reconnect and retry.
+                        # Clear the (now dead) session id first so the status report does not match a
+                        # recycled spid to an unrelated session while we reconnect.
+                        Emit "File $($file.FileId) connection lost; reconnecting"
+                        $shared.Sessions[$workerId].Spid = $null
+                        $shared.Sessions[$workerId].State = 'Reconnecting'
                         try { $conn.Dispose() } catch {}
                         try { $conn = Get-WConnResilient } catch { $connLost = $true }
                         if ($connLost) { break }
@@ -628,6 +653,7 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                             break
                         }
                     } catch [Microsoft.Data.SqlClient.SqlException] {
+                        if ($shared.Stop) { break }
                         $num = $_.Exception.Number
                         if ($num -eq 5201) {
                             if ($before -lt $startAlloc) {
@@ -639,17 +665,15 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                             }
                             break
                         }
-                        $attempt++
-                        if ($attempt -gt $connParams.RetryCount) {
-                            $bucket = Get-ShrinkGaveUpBucket -StartAllocMB $startAlloc -FinalAllocMB $before
-                            $bucketReason = "MSSQL error $num after $($connParams.RetryCount) retries: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
-                            Emit "Gave up on file $($file.FileId): $bucketReason"; break
-                        }
-                        $wait = Get-ShrinkBackoffSeconds -Attempt $attempt
-                        Emit "File $($file.FileId) MSSQL error $num (retry $attempt in $([int]$wait)s): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
                         if ($conn.State -ne 'Open') {
+                            # The connection dropped (server restart, failover, or the client machine
+                            # sleeping). Reconnecting is not a per-file failure, so it does not count
+                            # against the retry budget; Get-WConnResilient has its own bound. Clear the
+                            # dead session id first so the status report does not match a recycled spid.
+                            Emit "File $($file.FileId) connection lost (MSSQL error $num); reconnecting"
+                            $shared.Sessions[$workerId].Spid = $null
+                            $shared.Sessions[$workerId].State = 'Reconnecting'
                             try { $conn.Dispose() } catch {}
-                            Start-Sleep -Seconds $wait
                             try { $conn = Get-WConnResilient }
                             catch {
                                 $bucket = Get-ShrinkGaveUpBucket -StartAllocMB $startAlloc -FinalAllocMB $before
@@ -658,7 +682,19 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                                 $connLost = $true; break
                             }
                         }
-                        else { Start-Sleep -Seconds $wait }
+                        else {
+                            # The connection is still up but the command failed transiently; retry the
+                            # file up to the retry budget with backoff.
+                            $attempt++
+                            if ($attempt -gt $connParams.RetryCount) {
+                                $bucket = Get-ShrinkGaveUpBucket -StartAllocMB $startAlloc -FinalAllocMB $before
+                                $bucketReason = "MSSQL error $num after $($connParams.RetryCount) retries: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+                                Emit "Gave up on file $($file.FileId): $bucketReason"; break
+                            }
+                            $wait = Get-ShrinkBackoffSeconds -Attempt $attempt
+                            Emit "File $($file.FileId) MSSQL error $num (retry $attempt in $([int]$wait)s): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+                            Start-Sleep -Seconds $wait
+                        }
                     } finally {
                         $shared.Sessions[$workerId].Command = $null
                         try { $cmd.Dispose() } catch {}
@@ -678,7 +714,17 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
                 $shared.Sessions[$workerId].FileId = $null; $shared.Sessions[$workerId].State = 'Idle'
                 if ($connLost) { Emit 'connection lost and not recoverable; worker stopping'; break }
             }
-        } finally {
+        }
+        catch {
+            # Surface why a worker dies instead of failing silently - otherwise the error is only seen
+            # at run end via EndInvoke. The worker then exits cleanly through the finally below.
+            Emit "worker failed: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+        }
+        finally {
+            # Release any file this worker still owns (e.g. if it died mid-file) so another can retry it.
+            [System.Threading.Monitor]::Enter($shared.Lock)
+            try { foreach ($fid in @($shared.Owned.Keys)) { if ($shared.Owned[$fid] -eq $workerId) { $shared.Owned.Remove($fid) } } }
+            finally { [System.Threading.Monitor]::Exit($shared.Lock) }
             $shared.Sessions[$workerId].State = 'Stopped'
             try { $conn.Dispose() } catch {}
             Emit 'stopped'
@@ -696,15 +742,15 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
     }
     Write-ShrinkLog "Launched $effectiveSessions worker session(s)."
 
-    # graceful Ctrl+C: request stop and cancel any in-flight shrink operations
-    $cancelHandler = {
-        param($s, $e)
-        $e.Cancel = $true
-        $shared.Stop = $true
-        $shared.Events.Enqueue('Ctrl+C received: stopping (in-flight shrinks will be cancelled).')
-        foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
-    }.GetNewClosure()
-    [Console]::add_CancelKeyPress($cancelHandler)
+    # Graceful Ctrl+C: do NOT use a Console.CancelKeyPress handler - PowerShell raises that event on
+    # a background thread with no runspace, so a script handler throws and crashes the process. Make
+    # Ctrl+C an ordinary key instead and poll for it on this (runspace) thread in the monitor loop.
+    # Restored in the finally block. Only do this when we are attached to a console we can read keys from.
+    $ctrlCAsInput = $false
+    $prevTreatCtrlC = $false
+    if (-not [Console]::IsInputRedirected) {
+        try { $prevTreatCtrlC = [Console]::TreatControlCAsInput; [Console]::TreatControlCAsInput = $true; $ctrlCAsInput = $true } catch {}
+    }
 
     # ----- monitor loop -----
     $startTime = Get-Date
@@ -715,30 +761,36 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
         $evt = ''
         while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
         $spids = @($shared.Sessions.Values | Where-Object { $_.Spid } | ForEach-Object { [int]$_.Spid })
-        if ($spids.Count -eq 0) { return }
-        $inList = ($spids -join ',')
-        $sql = @"
+        $rows = [System.Collections.Generic.List[object]]::new()
+        # Query only for workers that currently have a live session id. A worker mid-reconnect has
+        # none (its spid was cleared), so it is shown from its shared state instead - this avoids
+        # matching a stale, recycled spid to an unrelated system session.
+        if ($spids.Count -gt 0) {
+            $inList = ($spids -join ',')
+            $sql = @"
 SELECT r.session_id, r.status, r.command, ISNULL(r.wait_type,'') AS wait_type, r.wait_time,
        ISNULL(r.wait_resource,'') AS wait_resource, r.percent_complete, r.total_elapsed_time,
        r.cpu_time, r.reads, r.writes, ISNULL(r.blocking_session_id,0) AS blocker,
        ISNULL((SELECT TOP 1 b.command FROM sys.dm_exec_requests b WHERE b.session_id = r.blocking_session_id),'') AS blocker_cmd
 FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
 "@
-        $cmd = $control.CreateCommand(); $cmd.CommandText = $sql; $cmd.CommandTimeout = 60
-        $rd = $cmd.ExecuteReader(); $rows = [System.Collections.Generic.List[object]]::new()
-        try { while ($rd.Read()) { $rows.Add([pscustomobject]@{
-                        Spid = [int]$rd['session_id']; Status = [string]$rd['status']; Command = [string]$rd['command']
-                        Wait = [string]$rd['wait_type']; WaitTime = [long]$rd['wait_time']; WaitRes = [string]$rd['wait_resource']
-                        Pct = [double]$rd['percent_complete']; Elapsed = [long]$rd['total_elapsed_time']
-                        Cpu = [long]$rd['cpu_time']; Reads = [long]$rd['reads']; Writes = [long]$rd['writes']; Blocker = [int]$rd['blocker']; BlockerCmd = [string]$rd['blocker_cmd']
-                    }) } } finally { $rd.Dispose(); $cmd.Dispose() }
+            $cmd = $control.CreateCommand(); $cmd.CommandText = $sql; $cmd.CommandTimeout = 60
+            $rd = $cmd.ExecuteReader()
+            try { while ($rd.Read()) { $rows.Add([pscustomobject]@{
+                            Spid = [int]$rd['session_id']; Status = [string]$rd['status']; Command = [string]$rd['command']
+                            Wait = [string]$rd['wait_type']; WaitTime = [long]$rd['wait_time']; WaitRes = [string]$rd['wait_resource']
+                            Pct = [double]$rd['percent_complete']; Elapsed = [long]$rd['total_elapsed_time']
+                            Cpu = [long]$rd['cpu_time']; Reads = [long]$rd['reads']; Writes = [long]$rd['writes']; Blocker = [int]$rd['blocker']; BlockerCmd = [string]$rd['blocker_cmd']
+                        }) } } finally { $rd.Dispose(); $cmd.Dispose() }
+        }
 
         Write-ShrinkLog '---- status ----'
         $statusData = [System.Collections.Generic.List[object]]::new()
         foreach ($sess in $shared.Sessions.GetEnumerator() | Sort-Object { $_.Key }) {
             $workerId = $sess.Key; $s = $sess.Value
             $seq = [int]$s.RequestSeq
-            # Elapsed is the worker's wall-clock time since it connected.
+            # Elapsed is the worker's wall-clock time on its current connection (it resets when the
+            # worker reconnects). The run-wide elapsed since script start is in the database-total section.
             $sessElapsedS = if ($s.ConnectTime) { [int]((Get-Date) - [datetime]$s.ConnectTime).TotalSeconds } else { $null }
             $row = $rows | Where-Object Spid -eq $s.Spid | Select-Object -First 1
             if (-not $row) {
@@ -792,7 +844,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         $statusTable = foreach ($d in $statusData) {
             [ordered]@{
                 Worker    = [string]$d.Worker
-                SPID      = [string]$d.Spid
+                SPID      = $(if ($null -ne $d.Spid) { [string]$d.Spid } else { '-' })
                 File      = $(if ($d.FileId) { [string]$d.FileId } else { '-' })
                 $usedHdr  = $(if ($null -ne $d.UsedMB) { $numFmt -f ([double]$d.UsedMB / $unit.PerMB) } else { '' })
                 $allocHdr = $(if ($null -ne $d.AllocMB) { $numFmt -f ([double]$d.AllocMB / $unit.PerMB) } else { '' })
@@ -817,6 +869,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         $c = Get-ShrinkBucketCounts -Buckets $buckets
         Write-ShrinkLog '---- database total ----'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
+                'Run time'           = (Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime))
                 'Used'               = (Format-ShrinkSize $dbUsedMb)
                 'Allocated'          = (Format-ShrinkSize $dbAllocMb)
                 'Shrunk'             = $c.Shrunk
@@ -838,6 +891,17 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         while ($true) {
             $evt = ''
             while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
+            if ($ctrlCAsInput -and [Console]::KeyAvailable) {
+                $k = [Console]::ReadKey($true)
+                if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) {
+                    Write-ShrinkLog 'Ctrl+C received: stopping; cancelling in-flight shrinks and writing the summary. Press Ctrl+C again to force quit.' 'WARN'
+                    $shared.Stop = $true
+                    foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
+                    # Restore default Ctrl+C so a second press can force-quit if a graceful stop hangs.
+                    try { [Console]::TreatControlCAsInput = $prevTreatCtrlC } catch {}
+                    $ctrlCAsInput = $false
+                }
+            }
             if ((Get-Date) -ge $nextReport) {
                 # The status report reads through the control connection; if the server dropped it
                 # (e.g. a restart), reopen it and skip just this report rather than failing the run.
@@ -861,7 +925,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             Start-Sleep -Seconds $pollSeconds
         }
     } finally {
-        [Console]::remove_CancelKeyPress($cancelHandler)
+        if ($ctrlCAsInput) { try { [Console]::TreatControlCAsInput = $prevTreatCtrlC } catch {} }
         foreach ($w in $workers) {
             try { $w.PS.EndInvoke($w.Handle) | Out-Null } catch { Write-ShrinkLog "Worker $($w.WorkerId) error: $($_.Exception.Message)" 'WARN' }
             $w.PS.Dispose()
@@ -882,7 +946,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         $c = Get-ShrinkBucketCounts -Buckets @($shared.Completed.Values | ForEach-Object { $_.Bucket })
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows ([ordered]@{
-                'Elapsed'            = $elapsed
+                'Run time'           = $elapsed
                 'Used'               = $(if ($null -ne $dbUsedMb) { Format-ShrinkSize $dbUsedMb } else { '(unavailable)' })
                 'Allocated'          = $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' })
                 'Shrunk'             = $c.Shrunk
@@ -902,6 +966,11 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
     catch {
         Write-ShrinkLog "Fatal error [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" 'ERROR'
         throw
+    }
+    finally {
+        # Safety net: make sure the control connection is closed on every exit path (report/return, a
+        # pre-flight failure, or a fatal error), not just the normal monitor-loop shutdown.
+        if ($control) { try { $control.Dispose() } catch {} }
     }
 }
 
