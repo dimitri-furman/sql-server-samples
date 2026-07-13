@@ -272,6 +272,12 @@ Describe 'Get-ShrinkNextTargetMB' {
     It 'clamps to the floor when a full step would overshoot it' {
         Get-ShrinkNextTargetMB -AllocatedMB 10500 -FloorMB 10000 | Should -Be 10000
     }
+    It 'never returns 0, since DBCC reads target 0 as the file creation size' {
+        Get-ShrinkNextTargetMB -AllocatedMB 10240 | Should -Be 1
+    }
+    It 'clamps an allocation within one step of 0 to 1 rather than 0' {
+        Get-ShrinkNextTargetMB -AllocatedMB 3000 | Should -Be 1
+    }
 }
 
 Describe 'Select-ShrinkNextFile' {

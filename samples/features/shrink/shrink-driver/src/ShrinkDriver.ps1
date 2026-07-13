@@ -1272,7 +1272,8 @@ function Get-ShrinkBackoffSeconds {
 }
 
 function Get-ShrinkNextTargetMB {
-    <# .SYNOPSIS Next SHRINKFILE target (MB): one step below the current size, but not past the floor. #>
+    <# .SYNOPSIS Next SHRINKFILE target (MB): one step below the current size, clamped to the floor and
+       to a minimum of 1 (DBCC reads a target of 0 as "shrink to the file's creation size"). #>
     [CmdletBinding()][OutputType([long])]
     param(
         [Parameter(Mandatory)][long]$AllocatedMB,
@@ -1282,6 +1283,10 @@ function Get-ShrinkNextTargetMB {
     $floor = if ($null -ne $FloorMB) { [long]$FloorMB } else { [long]0 }
     $next = $AllocatedMB - $StepMB
     if ($next -lt $floor) { $next = $floor }
+    # DBCC SHRINKFILE treats a target_size of 0 as "shrink to the file's creation size", which leaves
+    # used space unreclaimed (a file created at, say, 10 GiB never shrinks below 10 GiB). Never target
+    # 0: 1 MB shrinks to the actual used-data size (SQL will not shrink a file past its used pages).
+    if ($next -lt 1) { $next = 1 }
     [long]$next
 }
 
