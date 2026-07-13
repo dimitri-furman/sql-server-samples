@@ -118,6 +118,8 @@ A summary at the end reports how each file ended up:
 - **Already at target** — already at or below the requested target size.
 - **Grew** — ended larger than it started because other sessions added data during the shrink.
 - **Gave up** — abandoned after retries with no change in size.
+- **Interrupted** — shrinking of this file was cut short before any measurable result.
+- **Not processed** — eligible for shrinking, but the run ended before it was completed (for example, it never started, or the connection was lost and could not be recovered).
 
 Here's an example of the end summary:
 

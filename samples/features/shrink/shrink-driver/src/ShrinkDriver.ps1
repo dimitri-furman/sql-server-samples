@@ -426,8 +426,8 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     $shared.Files = [System.Collections.Generic.List[object]]::new(); $eligible | ForEach-Object { $shared.Files.Add($_) }
     # Completed: every file that reached a terminal state this run, keyed by file id. The
     # value records which bucket it landed in (Shrunk, PartlyShrunk, AlreadyMinimal,
-    # AlreadyAtTarget, Grew, or GaveUp) plus an optional reason. Files listed here are
-    # never selected again.
+    # AlreadyAtTarget, Grew, GaveUp, Interrupted, or NotProcessed) plus an optional reason.
+    # Files listed here are never selected again.
     $shared.Owned = @{}; $shared.Completed = @{}
     # Sessions is read by the monitor thread and written by every worker (at startup and on each state
     # change), so it must be thread-safe. A plain hashtable corrupts under concurrent writes, which can
@@ -435,7 +435,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     # stay plain hashtables because every access to them is already serialized by $shared.Lock.
     $shared.Sessions = [System.Collections.Concurrent.ConcurrentDictionary[int, object]]::new()
     $shared.Events = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    $shared.Stop = $false; $shared.Lock = [object]::new()
+    $shared.Stop = $false; $shared.StopReason = $null; $shared.Force = $false; $shared.Lock = [object]::new()
 
     $connParams = @{
         Server = $ServerName; Database = $DatabaseName; AuthType = $AuthType
@@ -549,7 +549,15 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                         $shared.Sessions[$workerId].Spid = $null
                         $shared.Sessions[$workerId].State = 'Reconnecting'
                         try { $conn.Dispose() } catch {}
-                        try { $conn = Get-WConnResilient } catch { $connLost = $true }
+                        try { $conn = Get-WConnResilient }
+                        catch {
+                            # Could not reconnect within the bound. This is an external failure, not the
+                            # shrink running out of options, and the file's final size was not reassessed,
+                            # so classify it as Interrupted rather than GaveUp.
+                            $bucket = 'Interrupted'
+                            $bucketReason = "lost the connection to the server and could not reconnect: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+                            $connLost = $true
+                        }
                         if ($connLost) { break }
                         continue
                     }
@@ -687,9 +695,11 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                             try { $conn.Dispose() } catch {}
                             try { $conn = Get-WConnResilient }
                             catch {
-                                $bucket = Get-ShrinkGaveUpBucket -StartAllocMB $startAlloc -FinalAllocMB $before
+                                # External failure, not a shrink that ran out of options: the last DBCC step
+                                # may have been mid-flight, so the final size is unknown. Classify as Interrupted.
+                                $bucket = 'Interrupted'
                                 $bucketReason = "lost the connection to the server and could not reconnect: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
-                                Emit "Gave up on file $($file.FileId): $bucketReason"
+                                Emit "File $($file.FileId) interrupted: $bucketReason"
                                 $connLost = $true; break
                             }
                         }
@@ -712,16 +722,51 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                     }
                 }
 
-                if (-not $shared.Stop) {
-                    [System.Threading.Monitor]::Enter($shared.Lock)
-                    try {
-                        $shared.Owned.Remove($file.FileId)
-                        if ($bucket) { $shared.Completed[$file.FileId] = @{ Bucket = $bucket; Reason = $bucketReason } }
-                    } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
-                } else {
-                    [System.Threading.Monitor]::Enter($shared.Lock)
-                    try { $shared.Owned.Remove($file.FileId) } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
+                # If the run was stopped while this file was still in progress, decide how to record it.
+                # An early stop that is not a forced quit (the run time limit, or the first Ctrl+C) is an
+                # orderly wind-down: reassess the file and report its real outcome - DBCC SHRINKFILE keeps
+                # the space it reclaimed even when cancelled, so a fresh measurement is authoritative. A
+                # forced quit (second Ctrl+C) or a lost connection leaves the file Interrupted instead.
+                if (-not $bucket -and $shared.Stop) {
+                    $causeText = if ($shared.StopReason -eq 'Timeout') { 'run time limit reached' } else { 'stopped early (Ctrl+C)' }
+                    if (-not $shared.Force -and $null -ne $startAlloc -and $conn.State -eq 'Open') {
+                        try {
+                            # Track this measurement as the session's command so a second Ctrl+C can cancel
+                            # it too, in case the server is unresponsive.
+                            $mcmd = $conn.CreateCommand()
+                            $mcmd.CommandText = "SELECT CAST(size/128.0 AS bigint) FROM sys.database_files WHERE file_id = $($file.FileId);"
+                            $shared.Sessions[$workerId].Command = $mcmd
+                            $final = [long]$mcmd.ExecuteScalar()
+                            $shared.Sessions[$workerId].Command = $null; $mcmd.Dispose()
+                            if ($final -lt $startAlloc) {
+                                $bucket = 'PartlyShrunk'
+                                $bucketReason = "$causeText; reduced from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $final)"
+                            } elseif ($final -gt $startAlloc) {
+                                $bucket = 'Grew'
+                                $bucketReason = "$causeText; grew from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $final) (other workloads adding data)"
+                            } else {
+                                $bucket = 'Interrupted'
+                                $bucketReason = "$causeText before this file made measurable progress"
+                            }
+                        } catch {
+                            $shared.Sessions[$workerId].Command = $null
+                            $bucket = 'Interrupted'
+                            $bucketReason = "$causeText; the final size could not be measured"
+                        }
+                    } elseif ($shared.Force) {
+                        $bucket = 'Interrupted'
+                        $bucketReason = 'stopped immediately (Ctrl+C pressed twice); the final size was not measured'
+                    } else {
+                        $bucket = 'Interrupted'
+                        $bucketReason = "$causeText while this file was being shrunk"
+                    }
                 }
+
+                [System.Threading.Monitor]::Enter($shared.Lock)
+                try {
+                    $shared.Owned.Remove($file.FileId)
+                    if ($bucket) { $shared.Completed[$file.FileId] = @{ Bucket = $bucket; Reason = $bucketReason } }
+                } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
                 $shared.Sessions[$workerId].FileId = $null; $shared.Sessions[$workerId].State = 'Idle'
                 if ($connLost) { Emit 'connection lost and not recoverable; worker stopping'; break }
             }
@@ -736,6 +781,11 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
             [System.Threading.Monitor]::Enter($shared.Lock)
             try { foreach ($fid in @($shared.Owned.Keys)) { if ($shared.Owned[$fid] -eq $workerId) { $shared.Owned.Remove($fid) } } }
             finally { [System.Threading.Monitor]::Exit($shared.Lock) }
+            # Clear the session id: once this connection is disposed the server can recycle its
+            # session_id for an unrelated (e.g. internal) task, and a lingering id would make the
+            # status report match that stranger's request. Nulling it (as on reconnect) drops the
+            # worker from the live-spid query and shows it as SPID '-', Stopped.
+            $shared.Sessions[$workerId].Spid = $null; $shared.Sessions[$workerId].FileId = $null
             $shared.Sessions[$workerId].State = 'Stopped'
             try { $conn.Dispose() } catch {}
             Emit 'stopped'
@@ -895,12 +945,23 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             if ($ctrlCAsInput -and [Console]::KeyAvailable) {
                 $k = [Console]::ReadKey($true)
                 if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) {
-                    Write-ShrinkLog 'Ctrl+C received: stopping; cancelling in-flight shrinks and writing the summary. Press Ctrl+C again to force quit.' 'WARN'
-                    $shared.Stop = $true
-                    foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
-                    # Restore default Ctrl+C so a second press can force-quit if a graceful stop hangs.
-                    try { [Console]::TreatControlCAsInput = $prevTreatCtrlC } catch {}
-                    $ctrlCAsInput = $false
+                    if (-not $shared.Stop) {
+                        # First Ctrl+C: stop early but still report what each in-flight file achieved, just
+                        # like the run time limit. Keep listening so a second press can be caught.
+                        Write-ShrinkLog 'Ctrl+C received: stopping early and recording each in-flight file''s current state. Press Ctrl+C again to stop immediately.' 'WARN'
+                        $shared.StopReason = 'Ctrl+C'
+                        $shared.Stop = $true
+                        foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
+                    } else {
+                        # Second Ctrl+C: don't wait to reassess (the server may be unresponsive); report the
+                        # in-flight files as Interrupted. Cancel any measurement in progress, then restore the
+                        # default handler so a further press can force-quit a truly wedged process.
+                        Write-ShrinkLog 'Ctrl+C received again: stopping immediately; in-flight files are reported as Interrupted.' 'WARN'
+                        $shared.Force = $true
+                        foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
+                        try { [Console]::TreatControlCAsInput = $prevTreatCtrlC } catch {}
+                        $ctrlCAsInput = $false
+                    }
                 }
             }
             if ((Get-Date) -ge $nextReport) {
@@ -918,7 +979,8 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             }
             if (-not ($workers | Where-Object { -not $_.Handle.IsCompleted })) { Write-ShrinkLog 'All workers finished.'; break }
             if ($deadline -and (Get-Date) -ge $deadline -and -not $shared.Stop) {
-                Write-ShrinkLog 'MaxRuntime reached: stopping.' 'WARN'
+                Write-ShrinkLog 'Run time limit reached: stopping and recording each in-flight file''s current state.' 'WARN'
+                $shared.StopReason = 'Timeout'
                 $shared.Stop = $true
                 foreach ($sess in $shared.Sessions.Values) { if ($sess.Command) { try { $sess.Command.Cancel() } catch {} } }
             }
@@ -943,13 +1005,24 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             $tot = Get-ShrinkDatabaseTotals -Conn $control
             $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
         } catch { Write-ShrinkLog ("Could not read final database totals: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
+        # Reconcile: any eligible file that never reached a terminal state (e.g. left unprocessed after
+        # an unrecoverable outage, or never started) is recorded as NotProcessed, so the summary reflects
+        # every eligible file instead of silently implying the run finished them all.
+        [System.Threading.Monitor]::Enter($shared.Lock)
+        try {
+            foreach ($f in $shared.Files) {
+                if (-not $shared.Completed.ContainsKey($f.FileId)) {
+                    $shared.Completed[$f.FileId] = @{ Bucket = 'NotProcessed'; Reason = 'eligible but not processed before the run ended' }
+                }
+            }
+        } finally { [System.Threading.Monitor]::Exit($shared.Lock) }
         $c = Get-ShrinkBucketCounts -Buckets @($shared.Completed.Values | ForEach-Object { $_.Bucket })
         Write-ShrinkLog '-------------------- summary --------------------'
         Format-ShrinkKeyValueTable -Rows (Get-ShrinkTotalsRows -RunTime $elapsed `
                 -Used $(if ($null -ne $dbUsedMb) { Format-ShrinkSize $dbUsedMb } else { '(unavailable)' }) `
                 -Allocated $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' }) -Counts $c) |
             ForEach-Object { Write-ShrinkLog $_ }
-        foreach ($r in $shared.Completed.GetEnumerator()) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
+        foreach ($r in $shared.Completed.GetEnumerator() | Sort-Object { [int]$_.Key }) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
         Write-ShrinkLog '-------------------------------------------------'
         try { $control.Close() } catch {}
         try { $control.Dispose() } catch {}
@@ -1178,6 +1251,8 @@ function Get-ShrinkBucketCounts {
         AlreadyAtTarget = @($Buckets | Where-Object { $_ -eq 'AlreadyAtTarget' }).Count
         Grew            = @($Buckets | Where-Object { $_ -eq 'Grew' }).Count
         GaveUp          = @($Buckets | Where-Object { $_ -eq 'GaveUp' }).Count
+        Interrupted     = @($Buckets | Where-Object { $_ -eq 'Interrupted' }).Count
+        NotProcessed    = @($Buckets | Where-Object { $_ -eq 'NotProcessed' }).Count
     }
 }
 
@@ -1201,6 +1276,8 @@ function Get-ShrinkTotalsRows {
         'Already at target'  = $Counts.AlreadyAtTarget
         'Grew'               = $Counts.Grew
         'Gave up'            = $Counts.GaveUp
+        'Interrupted'        = $Counts.Interrupted
+        'Not processed'      = $Counts.NotProcessed
     }
 }
 
@@ -1308,7 +1385,7 @@ function Get-ShrinkNextTargetMB {
     $next = $AllocatedMB - $StepMB
     if ($next -lt $floor) { $next = $floor }
     # DBCC SHRINKFILE treats a target_size of 0 as "shrink to the file's creation size", which leaves
-    # used space unreclaimed (a file created at, say, 10 GiB never shrinks below 10 GiB). Never target
+    # unused space unreclaimed (a file created at, say, 10 GiB never shrinks below 10 GiB). Never target
     # 0: 1 MB shrinks to the actual used-data size (SQL will not shrink a file past its used pages).
     if ($next -lt 1) { $next = 1 }
     [long]$next
@@ -1338,7 +1415,7 @@ function Select-ShrinkNextFile {
     if (-not $cand) { return $null }
     $cand |
         Sort-Object `
-            @{ Expression = { [long]$_.AllocatedMB - [long]$_.UsedMB }; Descending = $true }, `
+            @{ Expression = { Get-ShrinkReclaimableMB -AllocatedMB ([long]$_.AllocatedMB) -UsedMB ([long]$_.UsedMB) -FloorMB $_.FloorMB }; Descending = $true }, `
             @{ Expression = { [int]$_.FileId }; Descending = $false } |
         Select-Object -First 1
 }

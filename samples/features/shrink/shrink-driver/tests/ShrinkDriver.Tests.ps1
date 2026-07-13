@@ -310,11 +310,20 @@ Describe 'Select-ShrinkNextFile' {
     It 'returns null when nothing is reclaimable' {
         Select-ShrinkNextFile -Files @($script:files[2]) | Should -BeNullOrEmpty
     }
+    It 'ranks by reclaimable space above the floor, not raw unused space' {
+        # File 1 has more raw unused space (900) but a floor that leaves only 100 reclaimable; file 2
+        # has less unused space (500) but no floor, so 500 is reclaimable and it should be picked first.
+        $files = @(
+            [pscustomobject]@{ FileId = 1; AllocatedMB = 1000; UsedMB = 100; FloorMB = 900 } # reclaim 100
+            [pscustomobject]@{ FileId = 2; AllocatedMB = 1000; UsedMB = 500; FloorMB = $null } # reclaim 500
+        )
+        (Select-ShrinkNextFile -Files $files).FileId | Should -Be 2
+    }
 }
 
 Describe 'Get-ShrinkBucketCounts' {
     It 'tallies each bucket' {
-        $c = Get-ShrinkBucketCounts -Buckets @('Shrunk','Shrunk','AlreadyMinimal','AlreadyAtTarget','GaveUp','Shrunk','PartlyShrunk','Grew','Repacked','Repacked')
+        $c = Get-ShrinkBucketCounts -Buckets @('Shrunk','Shrunk','AlreadyMinimal','AlreadyAtTarget','GaveUp','Shrunk','PartlyShrunk','Grew','Repacked','Repacked','Interrupted','NotProcessed','NotProcessed')
         $c.Shrunk | Should -Be 3
         $c.Repacked | Should -Be 2
         $c.PartlyShrunk | Should -Be 1
@@ -322,6 +331,8 @@ Describe 'Get-ShrinkBucketCounts' {
         $c.AlreadyAtTarget | Should -Be 1
         $c.Grew | Should -Be 1
         $c.GaveUp | Should -Be 1
+        $c.Interrupted | Should -Be 1
+        $c.NotProcessed | Should -Be 2
     }
     It 'returns zeros for an empty set' {
         $c = Get-ShrinkBucketCounts -Buckets @()
@@ -332,6 +343,8 @@ Describe 'Get-ShrinkBucketCounts' {
         $c.AlreadyAtTarget | Should -Be 0
         $c.Grew | Should -Be 0
         $c.GaveUp | Should -Be 0
+        $c.Interrupted | Should -Be 0
+        $c.NotProcessed | Should -Be 0
     }
 }
 
@@ -351,7 +364,7 @@ Describe 'Get-ShrinkTotalsRows' {
     It 'builds the run-time, size, and bucket rows in order' {
         $counts = Get-ShrinkBucketCounts -Buckets @('Shrunk', 'Grew')
         $rows = Get-ShrinkTotalsRows -RunTime '1m 2s' -Used '10.0 GiB' -Allocated '20.0 GiB' -Counts $counts
-        @($rows.Keys) | Should -Be @('Run time', 'Used', 'Allocated', 'Shrunk', 'Repacked', 'Partly shrunk', 'Already at minimum', 'Already at target', 'Grew', 'Gave up')
+        @($rows.Keys) | Should -Be @('Run time', 'Used', 'Allocated', 'Shrunk', 'Repacked', 'Partly shrunk', 'Already at minimum', 'Already at target', 'Grew', 'Gave up', 'Interrupted', 'Not processed')
         $rows['Run time']  | Should -Be '1m 2s'
         $rows['Used']      | Should -Be '10.0 GiB'
         $rows['Allocated'] | Should -Be '20.0 GiB'
