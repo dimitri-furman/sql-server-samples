@@ -76,7 +76,7 @@ function Invoke-ShrinkDriver {
     .PARAMETER MaxRuntimeMinutes
       Optional overall time budget; the run stops when it is reached.
     .PARAMETER StepGiB
-      Increment size used for gradual shrinking (default 10 GiB).
+      Increment size used for gradual shrinking (default 20 GiB).
     .PARAMETER MinReclaimGiB
       Minimum unused space per file, in GiB, worth running a shrink pass to reclaim. A file whose unused space -
       or a file's remaining unused space after earlier passes - is below this is left as is (default 1 GiB).
@@ -122,7 +122,7 @@ function Invoke-ShrinkDriver {
         [ValidateRange(0, 50)][int]$RetryCount = 5,
         [ValidateRange(1, [int]::MaxValue)][Nullable[int]]$MaxRuntimeMinutes = $null,
 
-        [ValidateRange(1, [int]::MaxValue)][int]$StepGiB = 10,
+        [ValidateRange(1, [int]::MaxValue)][int]$StepGiB = 20,
         [ValidateRange(0, [int]::MaxValue)][int]$MinReclaimGiB = 1,
         [ValidateRange(1, [int]::MaxValue)][int]$StatusIntervalSeconds = 180,
         [ValidateRange(1, [int]::MaxValue)][int]$StuckWindowSeconds = 300,
@@ -1466,7 +1466,7 @@ function Get-ShrinkNextTargetMB {
     param(
         [Parameter(Mandatory)][long]$AllocatedMB,
         [Nullable[long]]$FloorMB = $null,
-        [long]$StepMB = 10240
+        [long]$StepMB = 20480
     )
     $floor = if ($null -ne $FloorMB) { [long]$FloorMB } else { [long]0 }
     $next = $AllocatedMB - $StepMB

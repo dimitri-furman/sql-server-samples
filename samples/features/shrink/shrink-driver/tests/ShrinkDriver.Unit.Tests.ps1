@@ -273,8 +273,8 @@ Describe 'Format-ShrinkFileReport' {
 }
 
 Describe 'Get-ShrinkNextTargetMB' {
-    It 'steps down by 10 GiB by default' {
-        Get-ShrinkNextTargetMB -AllocatedMB 100000 | Should -Be (100000 - 10240)
+    It 'steps down by 20 GiB by default' {
+        Get-ShrinkNextTargetMB -AllocatedMB 100000 | Should -Be (100000 - 20480)
     }
     It 'never goes below the floor' {
         Get-ShrinkNextTargetMB -AllocatedMB 12000 -FloorMB 10000 | Should -Be 10000

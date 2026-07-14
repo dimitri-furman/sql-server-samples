@@ -230,24 +230,29 @@ function Wait-ShrinkFreeSpaceSettled {
     <#
     .SYNOPSIS
       Wait until deferred deallocation is reflected in FILEPROPERTY 'SpaceUsed' (DROP TABLE space
-      release lags, even on a box engine). Polls until the minimum free MB across the data files
-      reaches $MinFreeMB, or the timeout elapses. Returns the observed minimum free MB.
+      release lags, even on a box engine). Polls until the minimum free MB across the data files has
+      reached $MinFreeMB and stopped growing (settled), or the timeout elapses. Returns the observed
+      minimum free MB.
     #>
     [CmdletBinding()][OutputType([int])]
     param(
         [Parameter(Mandatory)][pscustomobject]$TestDb,
         [int]$MinFreeMB = 8,
-        [int]$TimeoutSeconds = 60
+        [int]$TimeoutSeconds = 120
     )
     $sql = "SELECT CAST(size/128.0 AS int) - CAST(FILEPROPERTY(name,'SpaceUsed')/128.0 AS int) AS free_mb FROM sys.database_files WHERE type_desc = 'ROWS';"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $minFree = 0
+    $minFree = 0; $prevMin = -1
     do {
         Invoke-ShrinkTestSql -Context $TestDb -Database $TestDb.Database -Query 'CHECKPOINT;' | Out-Null
         Start-Sleep -Milliseconds 800
         $rows = @(Invoke-ShrinkTestSql -Context $TestDb -Database $TestDb.Database -Query $sql)
         $minFree = [int]($rows | Measure-Object -Property free_mb -Minimum).Minimum
-    } until ($minFree -ge $MinFreeMB -or $sw.Elapsed.TotalSeconds -gt $TimeoutSeconds)
+        # Settle once the reclaimable space has reached the floor and stopped growing between polls, so a
+        # later shrink sees the real free space rather than a still-deallocating snapshot.
+        $settled = ($minFree -ge $MinFreeMB) -and ($minFree -eq $prevMin)
+        $prevMin = $minFree
+    } until ($settled -or $sw.Elapsed.TotalSeconds -gt $TimeoutSeconds)
     $minFree
 }
 
@@ -276,6 +281,31 @@ function Add-ShrinkTestTailSpace {
     Invoke-ShrinkTestSql -Context $TestDb -Database $TestDb.Database -Query $sb.ToString() -CommandTimeout 120 | Out-Null
 }
 
+function Open-ShrinkTestBlocker {
+    <# .SYNOPSIS Open a connection that holds an exclusive lock on $TableName inside an open transaction,
+       so a concurrent shrink of that data blocks and cannot finish. Returns the live connection; pass it
+       to Close-ShrinkTestBlocker to roll back and release. #>
+    [CmdletBinding()][OutputType([Microsoft.Data.SqlClient.SqlConnection])]
+    param([Parameter(Mandatory)][pscustomobject]$TestDb, [string]$TableName = 'dbo.t2')
+    $conn = New-ShrinkTestConnection -ServerInstance $TestDb.ServerInstance -Database $TestDb.Database `
+        -Auth $TestDb.Auth -SqlLogin $TestDb.SqlLogin -SqlPassword $TestDb.SqlPassword
+    $cmd = $conn.CreateCommand()
+    $cmd.CommandText = "BEGIN TRAN; SELECT TOP (1) 1 FROM $TableName WITH (TABLOCKX, HOLDLOCK);"
+    $cmd.CommandTimeout = 30
+    $cmd.ExecuteNonQuery() | Out-Null
+    $cmd.Dispose()
+    $conn
+}
+
+function Close-ShrinkTestBlocker {
+    <# .SYNOPSIS Roll back the blocking transaction and dispose the connection from Open-ShrinkTestBlocker. #>
+    [CmdletBinding()]
+    param([Microsoft.Data.SqlClient.SqlConnection]$Connection)
+    if (-not $Connection) { return }
+    try { $c = $Connection.CreateCommand(); $c.CommandText = 'IF @@TRANCOUNT > 0 ROLLBACK;'; $c.ExecuteNonQuery() | Out-Null; $c.Dispose() } catch { }
+    try { $Connection.Dispose() } catch { }
+}
+
 function Remove-ShrinkTestDatabase {
     <# .SYNOPSIS Drop the test database and delete its files (box). #>
     [CmdletBinding()]
@@ -292,4 +322,4 @@ function Remove-ShrinkTestDatabase {
     if ($TestDb.DataDir -and (Test-Path $TestDb.DataDir)) { Remove-Item -Recurse -Force $TestDb.DataDir -ErrorAction SilentlyContinue }
 }
 
-Export-ModuleMember -Function Get-ShrinkTestServer, Get-ShrinkTestEngineEdition, New-ShrinkTestDatabase, Wait-ShrinkFreeSpaceSettled, Get-ShrinkTestFileSizes, Add-ShrinkTestTailSpace, Remove-ShrinkTestDatabase
+Export-ModuleMember -Function Get-ShrinkTestServer, Get-ShrinkTestEngineEdition, New-ShrinkTestDatabase, Wait-ShrinkFreeSpaceSettled, Get-ShrinkTestFileSizes, Add-ShrinkTestTailSpace, Open-ShrinkTestBlocker, Close-ShrinkTestBlocker, Remove-ShrinkTestDatabase

@@ -172,6 +172,92 @@ Describe 'ShrinkDriver integration' -Tag 'Integration' -Skip:(-not $server) {
         }
     }
 
+    Context 'Graceful stop on the run-time limit' {
+        BeforeAll {
+            $db = New-ShrinkTestDatabase -Context $server
+            Wait-ShrinkFreeSpaceSettled -TestDb $db -MinFreeMB 8 | Out-Null
+            # Hold an exclusive lock on a table the fixture keeps (it drops every other one) so the
+            # shrink must move that table's pages and blocks; the run then cannot finish and must stop
+            # when the short run-time limit fires.
+            $blocker = Open-ShrinkTestBlocker -TestDb $db -TableName 'dbo.t2'
+            try {
+                $res = Invoke-ShrinkDriver -ServerName $server.ServerInstance -DatabaseName $db.Database -Mode Shrink `
+                    -AuthType $server.Auth -WaitAtLowPriority:$false -BackoffBaseSeconds 0 -BackoffCapSeconds 0 `
+                    -MinReclaimMBOverride 1 -StepMBOverride 10 -Sessions 2 -StatusIntervalSeconds 2 `
+                    -MaxRuntimeSecondsOverride 5 -PassThru -LogPath $log 6>$null
+            }
+            finally {
+                Close-ShrinkTestBlocker -Connection $blocker
+            }
+        }
+        AfterAll { Remove-ShrinkTestDatabase -TestDb $db }
+
+        It 'stops because of the run-time limit' {
+            $res.StoppedBy | Should -Be 'Timeout'
+        }
+
+        It 'records in-flight or unprocessed files instead of dropping them' {
+            $res.Files.Count | Should -BeGreaterThan 0
+            ($res.Counts.Interrupted + $res.Counts.PartlyShrunk + $res.Counts.NotProcessed) | Should -BeGreaterThan 0
+        }
+    }
+
+    Context 'Worker reconnect after a dropped connection' -Skip:(-not $isBoxEngine) {
+        BeforeAll {
+            $db = New-ShrinkTestDatabase -Context $server
+            Wait-ShrinkFreeSpaceSettled -TestDb $db -MinFreeMB 8 | Out-Null
+            $rlog = Join-Path ([System.IO.Path]::GetTempPath()) ("shrinkdriver-reconnect-{0}.log" -f [guid]::NewGuid().ToString('N'))
+            # Block the shrink with an exclusive lock on a table the fixture keeps (it drops every other
+            # one) so the worker sessions stay connected, then kill one from a background job to force
+            # the driver's reconnect path. A short run-time limit ends the (blocked) run.
+            $blocker = Open-ShrinkTestBlocker -TestDb $db -TableName 'dbo.t2'
+            $killJob = Start-Job -ScriptBlock {
+                param($serverInstance, $database)
+                Import-Module SqlServer -ErrorAction Stop
+                $kills = 0
+                $deadline = (Get-Date).AddSeconds(30)
+                while ((Get-Date) -lt $deadline -and $kills -lt 2) {
+                    try {
+                        $r = Invoke-Sqlcmd -ServerInstance $serverInstance -Database $database -TrustServerCertificate -ErrorAction Stop `
+                            -Query "SELECT TOP (1) session_id AS spid FROM sys.dm_exec_sessions WHERE program_name LIKE 'ShrinkDriver-w%'"
+                        if ($r -and $null -ne $r.spid) {
+                            Invoke-Sqlcmd -ServerInstance $serverInstance -Database $database -TrustServerCertificate -ErrorAction Stop -Query "KILL $($r.spid)"
+                            $kills++
+                        }
+                    }
+                    catch { }
+                    Start-Sleep -Milliseconds 400
+                }
+                $kills
+            } -ArgumentList $server.ServerInstance, $db.Database
+            try {
+                $res = Invoke-ShrinkDriver -ServerName $server.ServerInstance -DatabaseName $db.Database -Mode Shrink `
+                    -AuthType $server.Auth -WaitAtLowPriority:$false -BackoffBaseSeconds 0 -BackoffCapSeconds 0 `
+                    -MinReclaimMBOverride 1 -StepMBOverride 10 -Sessions 3 -StatusIntervalSeconds 2 `
+                    -MaxRuntimeSecondsOverride 20 -PassThru -LogPath $rlog 6>$null
+            }
+            finally {
+                Close-ShrinkTestBlocker -Connection $blocker
+            }
+            $killCount = @(Receive-Job $killJob -Wait -AutoRemoveJob)[-1]
+            $rlogText = Get-Content -Raw -LiteralPath $rlog
+        }
+        AfterAll {
+            Remove-ShrinkTestDatabase -TestDb $db
+            if ($rlog -and (Test-Path $rlog)) { Remove-Item -LiteralPath $rlog -ErrorAction SilentlyContinue }
+        }
+
+        It 'reconnects a worker whose session was killed' {
+            $killCount | Should -BeGreaterThan 0
+            $rlogText | Should -Match 'reconnected on attempt'
+        }
+
+        It 'still accounts for every eligible file' {
+            $sum = ($res.Counts.PSObject.Properties | Measure-Object -Property Value -Sum).Sum
+            $sum | Should -Be $res.Files.Count
+        }
+    }
+
     Context 'Concurrency (files > sessions)' -Skip:(-not $isBoxEngine) {
         BeforeAll {
             $db = New-ShrinkTestDatabase -Context $server -FileCount 6
