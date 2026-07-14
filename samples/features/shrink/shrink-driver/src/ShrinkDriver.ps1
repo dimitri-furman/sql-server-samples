@@ -48,8 +48,9 @@ function Invoke-ShrinkDriver {
     .PARAMETER SqlLogin
       Login name; required when AuthType is SQL.
     .PARAMETER SqlPassword
-      Password as a SecureString; required when AuthType is SQL. Pass a SecureString, not plain
-      text - for example: $pw = Read-Host -AsSecureString 'SQL password'. A plain string is rejected.
+      Password as a SecureString, used when AuthType is SQL. Optional: if omitted, you are prompted for
+      it securely at run time. If supplied it must be a SecureString, not plain text - for example:
+      $pw = Read-Host -AsSecureString 'SQL password'. A plain string is rejected.
     .PARAMETER Sessions
       The maximum number of files to shrink concurrently (default 5). Capped at the eligible file count.
     .PARAMETER TruncateOnly
@@ -88,6 +89,10 @@ function Invoke-ShrinkDriver {
     .PARAMETER LogPath
       Log file path. Defaults to a timestamped file next to this script. The parent directory
       must already exist and be writable; otherwise the run stops before doing any work.
+    .PARAMETER PassThru
+      Emit a structured result object (mode, totals, per-file outcomes) to the pipeline for
+      programmatic callers. By default the run reports only to the console and log and returns
+      nothing, so interactive runs are not cluttered with a raw object dump.
     .EXAMPLE
       Invoke-ShrinkDriver -ServerName myserver.database.windows.net -DatabaseName MyDb -Sessions 5
     .EXAMPLE
@@ -121,12 +126,23 @@ function Invoke-ShrinkDriver {
         [ValidateRange(0, [int]::MaxValue)][int]$MinReclaimGiB = 1,
         [ValidateRange(1, [int]::MaxValue)][int]$StatusIntervalSeconds = 180,
         [ValidateRange(1, [int]::MaxValue)][int]$StuckWindowSeconds = 300,
-        [string]$LogPath
+        [string]$LogPath,
+        [switch]$PassThru,
+
+        # --- Test-only parameters (intentionally omitted from help; not for normal use) ---
+        # Shorten retry backoff and allow sub-GiB sizes / a seconds-level time limit so integration
+        # tests can drive the real paths quickly and deterministically.
+        [int]$BackoffBaseSeconds = 5,
+        [int]$BackoffCapSeconds = 60,
+        [Nullable[long]]$StepMBOverride = $null,
+        [Nullable[long]]$MinReclaimMBOverride = $null,
+        [Nullable[long]]$FileTargetMBOverride = $null,
+        [Nullable[int]]$MaxRuntimeSecondsOverride = $null
     )
 
     $ErrorActionPreference = 'Stop'
     $selfPath = $PSCommandPath
-    $hasTarget = $null -ne $FileTargetSizeGiB
+    $hasTarget = ($null -ne $FileTargetSizeGiB) -or ($null -ne $FileTargetMBOverride)
 
     # ----- validate parameters -----
     $paramSet = @{
@@ -140,9 +156,15 @@ function Invoke-ShrinkDriver {
         $validationErrors | ForEach-Object { Write-Error $_ }
         throw "Parameter validation failed with $($validationErrors.Count) error(s)."
     }
-    $stepMB = [long]$StepGiB * 1024
-    $floorMB = if ($hasTarget) { [long]$FileTargetSizeGiB * 1024 } else { $null }
-    $minReclaimMB = [long]$MinReclaimGiB * 1024
+    # SQL auth: prompt for the password securely if it was not supplied, so it never has to be typed on
+    # the command line (where it would be visible and saved in history). Validation already confirmed a
+    # SecureString when one was passed, and that SqlLogin is present.
+    if ($AuthType -eq 'SQL' -and -not $SqlPassword) {
+        $SqlPassword = Read-Host -AsSecureString "SQL password for login '$SqlLogin'"
+    }
+    $stepMB = if ($null -ne $StepMBOverride) { [long]$StepMBOverride } else { [long]$StepGiB * 1024 }
+    $floorMB = if ($null -ne $FileTargetMBOverride) { [long]$FileTargetMBOverride } elseif ($null -ne $FileTargetSizeGiB) { [long]$FileTargetSizeGiB * 1024 } else { $null }
+    $minReclaimMB = if ($null -ne $MinReclaimMBOverride) { [long]$MinReclaimMBOverride } else { [long]$MinReclaimGiB * 1024 }
 
     # ----- logging (console + mirrored file) -----
     if (-not $LogPath) {
@@ -219,6 +241,7 @@ function Invoke-ShrinkDriver {
 
     # Log any terminating error to the file before it propagates to the console.
     $control = $null
+    $runResult = $null
     try {
 
     # ----- connection helpers -----
@@ -312,16 +335,25 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
         $files
     }
 
-    function Get-ShrinkFileSize {
-        <# .SYNOPSIS Allocated and used size (MiB) of a single data file, fetched in one query. #>
-        param([Microsoft.Data.SqlClient.SqlConnection]$Conn, [int]$FileId)
+    function Get-ShrinkFileSizes {
+        <# .SYNOPSIS Allocated and used size (MiB) for a set of data files, fetched in one query,
+           returned as a hashtable keyed by file_id. Batching avoids one FILEPROPERTY round-trip per
+           file: during heavy concurrent shrink, FILEPROPERTY('SpaceUsed') contends on the same file
+           latches the shrink holds, so many separate calls routinely time out. #>
+        param([Microsoft.Data.SqlClient.SqlConnection]$Conn, [int[]]$FileIds)
+        $sizes = @{}
+        if (-not $FileIds -or $FileIds.Count -eq 0) { return $sizes }
         $cmd = $Conn.CreateCommand()
-        $cmd.CommandText = "SELECT size / 128.0 AS alloc_mb, ISNULL(FILEPROPERTY(name, 'SpaceUsed'), 0) / 128.0 AS used_mb FROM sys.database_files WHERE file_id = $FileId;"
-        $cmd.CommandTimeout = 30
+        $cmd.CommandText = "SELECT file_id, size / 128.0 AS alloc_mb, ISNULL(FILEPROPERTY(name, 'SpaceUsed'), 0) / 128.0 AS used_mb FROM sys.database_files WHERE file_id IN ($($FileIds -join ','));"
+        # A single batched query still calls FILEPROPERTY('SpaceUsed') on files being shrunk, so it can
+        # latch-wait under heavy concurrency; give it a generous timeout (well under the status interval)
+        # so a transient wait delays one report at most rather than dropping it.
+        $cmd.CommandTimeout = 120
         $rd = $cmd.ExecuteReader()
         try {
-            if ($rd.Read()) { @{ Alloc = [double]$rd['alloc_mb']; Used = [double]$rd['used_mb'] } } else { $null }
+            while ($rd.Read()) { $sizes[[int]$rd['file_id']] = @{ Alloc = [double]$rd['alloc_mb']; Used = [double]$rd['used_mb'] } }
         } finally { $rd.Dispose(); $cmd.Dispose() }
+        $sizes
     }
 
     function Get-ShrinkDatabaseTotals {
@@ -372,7 +404,18 @@ WHERE df.type_desc = 'ROWS' AND df.state_desc = 'ONLINE' AND fg.is_read_only = 0
             }) | ForEach-Object { Write-ShrinkLog $_ }
         Write-ShrinkLog '-------------------------------------------------'
         Write-ShrinkLog 'To shrink these files, run again with -Mode Shrink.'
-        $control.Close(); return
+        $control.Close()
+        $reportResult = [pscustomobject]@{
+            Mode             = 'Report'
+            DataFiles        = $report.Count
+            Eligible         = $eligibleFiles.Count
+            TotalUsedMB      = $sumUsed
+            TotalAllocatedMB = $sumAlloc
+            ReclaimableMB    = $sumRecl
+            Files            = @($report | ForEach-Object { [pscustomobject]@{ FileId = $_.FileId; Name = $_.Name; UsedMB = $_.UsedMB; AllocatedMB = $_.AllocatedMB; ReclaimableMB = $_.ReclaimableMB; IsEligible = $_.IsEligible } })
+        }
+        if ($PassThru) { return $reportResult }
+        return
     }
 
     # Supported platforms only: SQL Server 2022 or later, Azure SQL Database, and Azure SQL Managed
@@ -415,7 +458,19 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     Write-ShrinkLog ("Eligible data files: {0} of {1} (with at least {2} to reclaim). Total allocated {3}, used {4}, reclaimable {5}." -f `
             $eligible.Count, $allFiles.Count, (Format-ShrinkSize $minReclaimMB),
         (Format-ShrinkSize $allocSum), (Format-ShrinkSize $usedSum), (Format-ShrinkSize ($allocSum - $usedSum)))
-    if ($eligible.Count -eq 0) { Write-ShrinkLog ("No files have at least {0} of space to reclaim above the target. Nothing to do." -f (Format-ShrinkSize $minReclaimMB)); $control.Close(); return }
+    if ($eligible.Count -eq 0) {
+        Write-ShrinkLog ("No files have at least {0} of space to reclaim above the target. Nothing to do." -f (Format-ShrinkSize $minReclaimMB))
+        $control.Close()
+        return [pscustomobject]@{
+            Mode          = 'Shrink'
+            Elapsed       = '0s'
+            StoppedBy     = $null
+            DbUsedMB      = $usedSum
+            DbAllocatedMB = $allocSum
+            Counts        = (Get-ShrinkBucketCounts -Buckets @())
+            Files         = @()
+        }
+    }
     $effectiveSessions = [Math]::Min($Sessions, $eligible.Count)
     if ($effectiveSessions -lt $Sessions) {
         Write-ShrinkLog ("Capping concurrency to {0} (eligible file count) from requested {1}." -f $effectiveSessions, $Sessions) 'WARN'
@@ -444,6 +499,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
         Wlp = [bool]$WaitAtLowPriority; AbortAfterWait = $AbortAfterWait
         FloorMB = $floorMB; StepMB = $stepMB; RetryCount = $RetryCount
         MinReclaimMB = $minReclaimMB
+        BackoffBaseSec = $BackoffBaseSeconds; BackoffCapSec = $BackoffCapSeconds
     }
 
     $workerScript = {
@@ -504,7 +560,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                 }
                 catch {
                     if ($try -eq $maxTries) { throw }
-                    $w = Get-ShrinkBackoffSeconds -Attempt $try
+                    $w = Get-ShrinkBackoffSeconds -Attempt $try -BaseSec $connParams.BackoffBaseSec -CapSec $connParams.BackoffCapSec
                     Emit "reconnect attempt $try/$maxTries failed ($($_.Exception.Message.Split([Environment]::NewLine)[0])); retrying in $([int]$w)s"
                     Start-Sleep -Seconds $w
                 }
@@ -652,7 +708,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                                 }
                                 break
                             }
-                            $wait = Get-ShrinkBackoffSeconds -Attempt $attempt
+                            $wait = Get-ShrinkBackoffSeconds -Attempt $attempt -BaseSec $connParams.BackoffBaseSec -CapSec $connParams.BackoffCapSec
                             Emit "File $($file.FileId) grew during the shrink; retry $attempt in $([int]$wait)s"
                             Start-Sleep -Seconds $wait
                         }
@@ -712,7 +768,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                                 $bucketReason = "MSSQL error $num after $($connParams.RetryCount) retries: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
                                 Emit "Gave up on file $($file.FileId): $bucketReason"; break
                             }
-                            $wait = Get-ShrinkBackoffSeconds -Attempt $attempt
+                            $wait = Get-ShrinkBackoffSeconds -Attempt $attempt -BaseSec $connParams.BackoffBaseSec -CapSec $connParams.BackoffCapSec
                             Emit "File $($file.FileId) MSSQL error $num (retry $attempt in $([int]$wait)s): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
                             Start-Sleep -Seconds $wait
                         }
@@ -728,38 +784,22 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                 # the space it reclaimed even when cancelled, so a fresh measurement is authoritative. A
                 # forced quit (second Ctrl+C) or a lost connection leaves the file Interrupted instead.
                 if (-not $bucket -and $shared.Stop) {
-                    $causeText = if ($shared.StopReason -eq 'Timeout') { 'run time limit reached' } else { 'stopped early (Ctrl+C)' }
+                    $cause = if ($shared.StopReason -eq 'Timeout') { 'Timeout' } else { 'Ctrl+C' }
+                    # Re-measure the file's real size (unless force-quitting or the connection is gone).
+                    # DBCC SHRINKFILE keeps the space it reclaimed even when cancelled, so a fresh read is
+                    # authoritative. Track the command so a second Ctrl+C can cancel it if the server hangs.
+                    $final = $null
                     if (-not $shared.Force -and $null -ne $startAlloc -and $conn.State -eq 'Open') {
                         try {
-                            # Track this measurement as the session's command so a second Ctrl+C can cancel
-                            # it too, in case the server is unresponsive.
                             $mcmd = $conn.CreateCommand()
                             $mcmd.CommandText = "SELECT CAST(size/128.0 AS bigint) FROM sys.database_files WHERE file_id = $($file.FileId);"
                             $shared.Sessions[$workerId].Command = $mcmd
                             $final = [long]$mcmd.ExecuteScalar()
                             $shared.Sessions[$workerId].Command = $null; $mcmd.Dispose()
-                            if ($final -lt $startAlloc) {
-                                $bucket = 'PartlyShrunk'
-                                $bucketReason = "$causeText; reduced from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $final)"
-                            } elseif ($final -gt $startAlloc) {
-                                $bucket = 'Grew'
-                                $bucketReason = "$causeText; grew from $(Format-ShrinkSize $startAlloc) to $(Format-ShrinkSize $final) (other workloads adding data)"
-                            } else {
-                                $bucket = 'Interrupted'
-                                $bucketReason = "$causeText before this file made measurable progress"
-                            }
-                        } catch {
-                            $shared.Sessions[$workerId].Command = $null
-                            $bucket = 'Interrupted'
-                            $bucketReason = "$causeText; the final size could not be measured"
-                        }
-                    } elseif ($shared.Force) {
-                        $bucket = 'Interrupted'
-                        $bucketReason = 'stopped immediately (Ctrl+C pressed twice); the final size was not measured'
-                    } else {
-                        $bucket = 'Interrupted'
-                        $bucketReason = "$causeText while this file was being shrunk"
+                        } catch { $shared.Sessions[$workerId].Command = $null; $final = $null }
                     }
+                    $outcome = Get-ShrinkStopOutcome -StartAllocMB $startAlloc -FinalAllocMB $final -Cause $cause -Force:([bool]$shared.Force)
+                    $bucket = $outcome.Bucket; $bucketReason = $outcome.Reason
                 }
 
                 [System.Threading.Monitor]::Enter($shared.Lock)
@@ -815,7 +855,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
 
     # ----- monitor loop -----
     $startTime = Get-Date
-    $deadline = if ($null -ne $MaxRuntimeMinutes) { $startTime.AddMinutes([int]$MaxRuntimeMinutes) } else { $null }
+    $deadline = if ($null -ne $MaxRuntimeSecondsOverride) { $startTime.AddSeconds([int]$MaxRuntimeSecondsOverride) } elseif ($null -ne $MaxRuntimeMinutes) { $startTime.AddMinutes([int]$MaxRuntimeMinutes) } else { $null }
     $prev = @{}; $stuckState = @{}
 
     function Write-StatusReport {
@@ -844,6 +884,11 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         }
 
         Write-ShrinkLog '---- status ----'
+        # Fetch every in-flight file's size in one query rather than one FILEPROPERTY round-trip per
+        # worker: FILEPROPERTY('SpaceUsed') contends on the same file latches the shrink holds, so
+        # under high concurrency the per-file calls time out and the whole report is dropped.
+        $statusFileIds = @($shared.Sessions.Values | Where-Object { $_.FileId } | ForEach-Object { [int]$_.FileId } | Sort-Object -Unique)
+        $sizeById = Get-ShrinkFileSizes -Conn $control -FileIds $statusFileIds
         $statusData = [System.Collections.Generic.List[object]]::new()
         foreach ($sess in $shared.Sessions.GetEnumerator() | Sort-Object { $_.Key }) {
             $workerId = $sess.Key; $s = $sess.Value
@@ -873,7 +918,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 $dWrites = if ($rw.IsReset) { '-' } else { '{0:N0}' -f $rw.Delta }
             }
             $prev[$s.Spid] = @{ Seq = $seq; Cpu = $row.Cpu; Reads = $row.Reads; Writes = $row.Writes }
-            $z = if ($s.FileId) { Get-ShrinkFileSize -Conn $control -FileId ([int]$s.FileId) } else { $null }
+            $z = if ($s.FileId -and $sizeById.ContainsKey([int]$s.FileId)) { $sizeById[[int]$s.FileId] } else { $null }
             $statusData.Add([pscustomobject]@{
                     Worker = $workerId; Spid = $s.Spid; FileId = $s.FileId
                     UsedMB = $(if ($z) { $z.Used } else { $null }); AllocMB = $(if ($z) { $z.Alloc } else { $null })
@@ -1024,6 +1069,16 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             ForEach-Object { Write-ShrinkLog $_ }
         foreach ($r in $shared.Completed.GetEnumerator() | Sort-Object { [int]$_.Key }) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
         Write-ShrinkLog '-------------------------------------------------'
+        # Structured result for programmatic callers / tests (the log/console is unchanged).
+        $runResult = [pscustomobject]@{
+            Mode          = 'Shrink'
+            Elapsed       = $elapsed
+            StoppedBy     = $shared.StopReason
+            DbUsedMB      = $dbUsedMb
+            DbAllocatedMB = $dbAllocMb
+            Counts        = $c
+            Files         = @($shared.Completed.GetEnumerator() | Sort-Object { [int]$_.Key } | ForEach-Object { [pscustomobject]@{ FileId = [int]$_.Key; Bucket = $_.Value.Bucket; Reason = $_.Value.Reason } })
+        }
         try { $control.Close() } catch {}
         try { $control.Dispose() } catch {}
     }
@@ -1037,6 +1092,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         # pre-flight failure, or a fatal error), not just the normal monitor-loop shutdown.
         if ($control) { try { $control.Dispose() } catch {} }
     }
+    if ($PassThru) { $runResult }
 }
 
 # ----- internal helper functions (used by Invoke-ShrinkDriver and the worker runspaces) -----
@@ -1296,6 +1352,39 @@ function Get-ShrinkGaveUpBucket {
     else { 'GaveUp' }
 }
 
+function Get-ShrinkStopOutcome {
+    <# .SYNOPSIS
+      Classify a file's outcome when the run is stopped before the file finished. A forced quit
+      (second Ctrl+C) is always Interrupted; otherwise the file is judged by its re-measured size:
+      smaller than it started -> PartlyShrunk, larger -> Grew, unchanged -> Interrupted (no progress).
+      StartAllocMB null (never measured) or FinalAllocMB null (could not re-measure) -> Interrupted.
+      Pure/side-effect-free so the two-stage Ctrl+C and run-time-limit classification is unit-testable. #>
+    [CmdletBinding()][OutputType([pscustomobject])]
+    param(
+        [Nullable[long]]$StartAllocMB,
+        [Nullable[long]]$FinalAllocMB,
+        [ValidateSet('Timeout', 'Ctrl+C')][string]$Cause = 'Ctrl+C',
+        [switch]$Force
+    )
+    $causeText = if ($Cause -eq 'Timeout') { 'run time limit reached' } else { 'stopped early (Ctrl+C)' }
+    if ($Force) {
+        return [pscustomobject]@{ Bucket = 'Interrupted'; Reason = 'stopped immediately (Ctrl+C pressed twice); the final size was not measured' }
+    }
+    if ($null -eq $StartAllocMB) {
+        return [pscustomobject]@{ Bucket = 'Interrupted'; Reason = "$causeText while this file was being shrunk" }
+    }
+    if ($null -eq $FinalAllocMB) {
+        return [pscustomobject]@{ Bucket = 'Interrupted'; Reason = "$causeText; the final size could not be measured" }
+    }
+    if ([long]$FinalAllocMB -lt [long]$StartAllocMB) {
+        return [pscustomobject]@{ Bucket = 'PartlyShrunk'; Reason = "$causeText; reduced from $(Format-ShrinkSize $StartAllocMB) to $(Format-ShrinkSize $FinalAllocMB)" }
+    }
+    if ([long]$FinalAllocMB -gt [long]$StartAllocMB) {
+        return [pscustomobject]@{ Bucket = 'Grew'; Reason = "$causeText; grew from $(Format-ShrinkSize $StartAllocMB) to $(Format-ShrinkSize $FinalAllocMB) (other workloads adding data)" }
+    }
+    return [pscustomobject]@{ Bucket = 'Interrupted'; Reason = "$causeText before this file made measurable progress" }
+}
+
 function Test-ShrinkParameterSet {
     <# .SYNOPSIS Validate a parameter set; returns an array of error strings (empty = valid). #>
     [CmdletBinding()]
@@ -1314,9 +1403,7 @@ function Test-ShrinkParameterSet {
             $errors.Add('SqlLogin is required for SQL authentication.')
         }
         $pw = $Params['SqlPassword']
-        if (-not $pw) {
-            $errors.Add('SqlPassword is required for SQL authentication.')
-        } elseif ($pw -isnot [securestring]) {
+        if ($pw -and $pw -isnot [securestring]) {
             $errors.Add("SqlPassword must be a SecureString, not plain text. Create one with: `$pw = Read-Host -AsSecureString 'SQL password'; then pass -SqlPassword `$pw.")
         }
     }

@@ -1,7 +1,7 @@
 #requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 <#
   Unit tests for ShrinkDriver.
-  Run:  Invoke-Pester -Path .\tests\ShrinkDriver.Tests.ps1
+  Run:  Invoke-Pester -Path .\tests\ShrinkDriver.Unit.Tests.ps1
 #>
 
 BeforeAll {
@@ -19,10 +19,10 @@ Describe 'Test-ShrinkParameterSet' {
         $e = Test-ShrinkParameterSet @{ AuthType='EntraID'; Sessions=5; AbortAfterWait='SELF'; TruncateOnly=$true; FileTargetSizeGiB=100 }
         ($e -join ';') | Should -Match 'FileTargetSizeGiB'
     }
-    It 'requires login and password for SQL auth' {
+    It 'requires a login for SQL auth (the password is prompted, not required)' {
         $e = Test-ShrinkParameterSet @{ AuthType='SQL'; Sessions=5; AbortAfterWait='SELF' }
         ($e -join ';') | Should -Match 'SqlLogin'
-        ($e -join ';') | Should -Match 'SqlPassword'
+        ($e -join ';') | Should -Not -Match 'SqlPassword'
     }
     It 'rejects a plain-text SqlPassword for SQL auth' {
         $e = Test-ShrinkParameterSet @{ AuthType='SQL'; SqlLogin='u'; SqlPassword='p'; AbortAfterWait='SELF' }
@@ -357,6 +357,35 @@ Describe 'Get-ShrinkGaveUpBucket' {
     }
     It 'classifies no change as GaveUp' {
         Get-ShrinkGaveUpBucket -StartAllocMB 1000 -FinalAllocMB 1000 | Should -Be 'GaveUp'
+    }
+}
+
+Describe 'Get-ShrinkStopOutcome' {
+    It 'reports Interrupted on a forced quit regardless of sizes' {
+        $o = Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 600 -Cause 'Ctrl+C' -Force
+        $o.Bucket | Should -Be 'Interrupted'
+        $o.Reason | Should -Match 'twice'
+    }
+    It 'reports PartlyShrunk when the file ended smaller' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 600 -Cause 'Timeout').Bucket | Should -Be 'PartlyShrunk'
+    }
+    It 'reports Grew when the file ended larger' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 1200 -Cause 'Ctrl+C').Bucket | Should -Be 'Grew'
+    }
+    It 'reports Interrupted (no progress) when the size is unchanged' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 1000 -Cause 'Timeout').Bucket | Should -Be 'Interrupted'
+    }
+    It 'reports Interrupted when the file was never measured (null start)' {
+        (Get-ShrinkStopOutcome -StartAllocMB $null -FinalAllocMB $null -Cause 'Ctrl+C').Bucket | Should -Be 'Interrupted'
+    }
+    It 'reports Interrupted when the final size could not be read (null final)' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB $null -Cause 'Timeout').Bucket | Should -Be 'Interrupted'
+    }
+    It 'uses a run-time-limit reason for the Timeout cause' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 600 -Cause 'Timeout').Reason | Should -Match 'run time limit'
+    }
+    It 'uses a Ctrl+C reason for the Ctrl+C cause' {
+        (Get-ShrinkStopOutcome -StartAllocMB 1000 -FinalAllocMB 600 -Cause 'Ctrl+C').Reason | Should -Match 'Ctrl\+C'
     }
 }
 

@@ -40,9 +40,8 @@ Invoke-ShrinkDriver -ServerName myserver.database.windows.net -DatabaseName MyDb
 # Shrink with Windows auth: don't shrink below 500 GiB, working on up to 8 files concurrently
 Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -Mode Shrink -AuthType Windows -FileTargetSizeGiB 500 -Sessions 8
 
-# Shrink with SQL auth
-$pw = Read-Host -AsSecureString 'SQL password'
-Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -Mode Shrink -AuthType SQL -SqlLogin appuser -SqlPassword $pw
+# Shrink with SQL auth (prompts securely for the password when it is not supplied)
+Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -Mode Shrink -AuthType SQL -SqlLogin appuser
 ```
 
 For the full list of parameters and what they do:
@@ -141,12 +140,7 @@ Here's an example of the end summary:
 
 ## Tests
 
-Unit tests for the pure helper functions (no database required) use
-[Pester](https://pester.dev) 5 or later:
-
-```powershell
-Invoke-Pester -Path .\tests\ShrinkDriver.Tests.ps1
-```
+The script ships with unit and integration tests. For more information, see [tests/README.md](tests/README.md).
 
 ## Shrink documentation
 
