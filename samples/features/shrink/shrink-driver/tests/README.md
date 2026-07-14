@@ -65,6 +65,8 @@ $env:SHRINKDRIVER_TEST_SERVER = 'myserver.database.windows.net'
 $env:SHRINKDRIVER_TEST_AUTH   = 'EntraID'      # EntraID | Windows | SQL
 # For SQL authentication, also set the login; the password is requested securely when the tests run:
 # $env:SHRINKDRIVER_TEST_LOGIN = 'appuser'
+# Only for an instance with a self-signed certificate if you trust the connection:
+# $env:SHRINKDRIVER_TEST_TRUSTCERT = '1'
 
 Invoke-Pester -Path .\tests\ShrinkDriver.Integration.Tests.ps1 -Tag Integration
 

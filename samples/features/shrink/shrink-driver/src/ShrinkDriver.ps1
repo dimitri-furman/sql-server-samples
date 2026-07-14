@@ -51,6 +51,11 @@ function Invoke-ShrinkDriver {
       Password as a SecureString, used when AuthType is SQL. Optional: if omitted, you are prompted for
       it securely at run time. If supplied it must be a SecureString, not plain text - for example:
       $pw = Read-Host -AsSecureString 'SQL password'. A plain string is rejected.
+    .PARAMETER TrustServerCertificate
+      Allow connecting when the server's TLS certificate cannot be validated - for example a local
+      development SQL Server with a self-signed certificate (the connection is still encrypted). Off by
+      default. It is a fallback only: the driver always tries a fully validated connection first, so a
+      server with a trusted certificate (such as Azure SQL) is never connected to without validation.
     .PARAMETER Sessions
       The maximum number of files to shrink concurrently (default 5). Capped at the eligible file count.
     .PARAMETER TruncateOnly
@@ -110,6 +115,7 @@ function Invoke-ShrinkDriver {
         [ValidateSet('EntraID', 'Windows', 'SQL')][string]$AuthType = 'EntraID',
         [string]$SqlLogin,
         [object]$SqlPassword,
+        [switch]$TrustServerCertificate,
 
         [ValidateRange(1, [int]::MaxValue)][int]$Sessions = 5,
         [ValidateSet('Report', 'Shrink')][string]$Mode = 'Report',
@@ -215,6 +221,7 @@ function Invoke-ShrinkDriver {
         "Database         : $DatabaseName"
         "Mode             : $Mode"
         "AuthType         : $AuthType" + $(if ($AuthType -eq 'SQL') { " (login $SqlLogin)" } else { '' })
+        "TrustServerCert  : $([bool]$TrustServerCertificate)" + $(if ([bool]$TrustServerCertificate) { ' (used only as a fallback if certificate validation fails)' } else { '' })
         "Sessions         : $Sessions"
         "TruncateOnly     : $([bool]$TruncateOnly)"
         "NoTruncate       : $([bool]$NoTruncate)"
@@ -267,28 +274,25 @@ function Invoke-ShrinkDriver {
         $retry = New-ShrinkRetryProvider
         if ($AuthType -eq 'Windows') {
             $csb['Integrated Security'] = $true
-            $conn = [Microsoft.Data.SqlClient.SqlConnection]::new(); $conn.ConnectionString = $csb.ConnectionString
-            if ($retry) { $conn.RetryLogicProvider = $retry }
-            $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
+            $conn = Open-ShrinkSqlConnection -Builder $csb -RetryProvider $retry -AllowTrustServerCertificate ([bool]$TrustServerCertificate)
+            return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
         }
         if ($AuthType -eq 'SQL') {
-            $conn = [Microsoft.Data.SqlClient.SqlConnection]::new(); $conn.ConnectionString = $csb.ConnectionString
             $pw = $SqlPassword.Copy(); $pw.MakeReadOnly()
-            $conn.Credential = [Microsoft.Data.SqlClient.SqlCredential]::new($SqlLogin, $pw)
-            if ($retry) { $conn.RetryLogicProvider = $retry }
-            $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
+            $cred = [Microsoft.Data.SqlClient.SqlCredential]::new($SqlLogin, $pw)
+            $conn = Open-ShrinkSqlConnection -Builder $csb -Credential $cred -RetryProvider $retry -AllowTrustServerCertificate ([bool]$TrustServerCertificate)
+            return [pscustomobject]@{ Connection = $conn; EntraMode = $null }
         }
         # EntraID: try the ambient credential (managed identity, Azure CLI, Azure PowerShell,
         # Visual Studio) first; if it is unavailable, fall back to interactive sign-in. The mode
-        # that succeeds is reused by the worker sessions.
+        # that succeeds is reused by the worker sessions. EntraID targets Azure SQL, whose certificate
+        # is always valid, so certificate trust is never needed here.
         foreach ($mode in @('Active Directory Default', 'Active Directory Interactive')) {
-            $conn = [Microsoft.Data.SqlClient.SqlConnection]::new()
-            $csb['Authentication'] = $mode; $conn.ConnectionString = $csb.ConnectionString
-            if ($retry) { $conn.RetryLogicProvider = $retry }
+            $csb['Authentication'] = $mode
             try {
-                $conn.Open(); return [pscustomobject]@{ Connection = $conn; EntraMode = $mode }
+                $conn = Open-ShrinkSqlConnection -Builder $csb -RetryProvider $retry -AllowTrustServerCertificate $false
+                return [pscustomobject]@{ Connection = $conn; EntraMode = $mode }
             } catch {
-                try { $conn.Dispose() } catch {}
                 if ($mode -eq 'Active Directory Interactive') { throw }
                 # The ambient credential is often unavailable on dev machines, and interactive
                 # sign-in silently reuses a cached token (no browser prompt) when one exists, so
@@ -495,6 +499,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     $connParams = @{
         Server = $ServerName; Database = $DatabaseName; AuthType = $AuthType
         SqlLogin = $SqlLogin; SqlPassword = $SqlPassword; EntraMode = $resolvedEntraMode
+        TrustAllowed = [bool]$TrustServerCertificate
         TruncateOnly = [bool]$TruncateOnly; NoTruncate = [bool]$NoTruncate
         Wlp = [bool]$WaitAtLowPriority; AbortAfterWait = $AbortAfterWait
         FloorMB = $floorMB; StepMB = $stepMB; RetryCount = $RetryCount
@@ -512,19 +517,22 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
             $csb['Data Source'] = $connParams.Server; $csb['Initial Catalog'] = $connParams.Database
             $csb['Encrypt'] = $true; $csb['Connect Timeout'] = 30; $csb['Application Name'] = "ShrinkDriver-w$workerId"
             $csb['Pooling'] = $false   # dedicated, long-lived connection; close it for real on Dispose
-            $c = [Microsoft.Data.SqlClient.SqlConnection]::new()
-            switch ($connParams.AuthType) {
-                'Windows' { $csb['Integrated Security'] = $true; $c.ConnectionString = $csb.ConnectionString }
-                'SQL' {
-                    $c.ConnectionString = $csb.ConnectionString
-                    $pw = $connParams.SqlPassword.Copy(); $pw.MakeReadOnly()
-                    $c.Credential = [Microsoft.Data.SqlClient.SqlCredential]::new($connParams.SqlLogin, $pw)
-                }
-                default { $csb['Authentication'] = $connParams.EntraMode; $c.ConnectionString = $csb.ConnectionString }
-            }
             $retry = New-ShrinkRetryProvider
-            if ($retry) { $c.RetryLogicProvider = $retry }
-            $c.Open(); $c
+            switch ($connParams.AuthType) {
+                'Windows' {
+                    $csb['Integrated Security'] = $true
+                    Open-ShrinkSqlConnection -Builder $csb -RetryProvider $retry -AllowTrustServerCertificate $connParams.TrustAllowed
+                }
+                'SQL' {
+                    $pw = $connParams.SqlPassword.Copy(); $pw.MakeReadOnly()
+                    $cred = [Microsoft.Data.SqlClient.SqlCredential]::new($connParams.SqlLogin, $pw)
+                    Open-ShrinkSqlConnection -Builder $csb -Credential $cred -RetryProvider $retry -AllowTrustServerCertificate $connParams.TrustAllowed
+                }
+                default {
+                    $csb['Authentication'] = $connParams.EntraMode
+                    Open-ShrinkSqlConnection -Builder $csb -RetryProvider $retry -AllowTrustServerCertificate $false
+                }
+            }
         }
         function Emit($msg) { $shared.Events.Enqueue(('worker {0}: {1}' -f $workerId, $msg)) }
         function Get-Size($conn, $fileId) {
@@ -1119,6 +1127,33 @@ function New-ShrinkRetryProvider {
     # transient error numbers (Azure SQL restart/failover/throttling and transport drops). Our own
     # retry loop is a broad catch-all backstop for anything the default list happens to omit.
     [Microsoft.Data.SqlClient.SqlConfigurableRetryFactory]::CreateExponentialRetryProvider($opt)
+}
+
+function Open-ShrinkSqlConnection {
+    <# .SYNOPSIS
+      Open a SqlConnection from a connection-string builder, validating the server's certificate. The
+      first attempt always validates the certificate; only if it fails and $AllowTrustServerCertificate
+      is set does it retry once trusting the certificate. #>
+    [CmdletBinding()][OutputType([Microsoft.Data.SqlClient.SqlConnection])]
+    param(
+        [Parameter(Mandatory)][Microsoft.Data.SqlClient.SqlConnectionStringBuilder]$Builder,
+        [Microsoft.Data.SqlClient.SqlCredential]$Credential,
+        [object]$RetryProvider,
+        [bool]$AllowTrustServerCertificate
+    )
+    foreach ($trust in @($false, $true)) {
+        if ($trust) { $Builder['TrustServerCertificate'] = $true } else { [void]$Builder.Remove('TrustServerCertificate') }
+        $conn = [Microsoft.Data.SqlClient.SqlConnection]::new()
+        $conn.ConnectionString = $Builder.ConnectionString
+        if ($Credential) { $conn.Credential = $Credential }
+        if ($RetryProvider) { $conn.RetryLogicProvider = $RetryProvider }
+        try { $conn.Open(); return $conn }
+        catch {
+            try { $conn.Dispose() } catch {}
+            # Surface the error unless a trusting retry is still allowed and untried.
+            if ($trust -or -not $AllowTrustServerCertificate) { throw }
+        }
+    }
 }
 
 function Format-ShrinkSize {

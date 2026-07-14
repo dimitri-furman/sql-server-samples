@@ -28,13 +28,14 @@ function New-ShrinkTestConnection {
         [string]$Database = 'master',
         [ValidateSet('Windows', 'EntraID', 'SQL')][string]$Auth = 'Windows',
         [string]$SqlLogin,
-        [securestring]$SqlPassword
+        [securestring]$SqlPassword,
+        [bool]$TrustServerCertificate = $false
     )
     $csb = [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new()
     $csb['Data Source'] = $ServerInstance
     $csb['Initial Catalog'] = $Database
     $csb['Encrypt'] = $true
-    $csb['TrustServerCertificate'] = $true
+    $csb['TrustServerCertificate'] = $TrustServerCertificate
     $csb['Connect Timeout'] = 60
     $csb['Pooling'] = $false
     $conn = [Microsoft.Data.SqlClient.SqlConnection]::new()
@@ -83,7 +84,8 @@ function Invoke-ShrinkTestSql {
         [int]$CommandTimeout = 300
     )
     $conn = New-ShrinkTestConnection -ServerInstance $Context.ServerInstance -Database $Database `
-        -Auth $Context.Auth -SqlLogin $Context.SqlLogin -SqlPassword $Context.SqlPassword
+        -Auth $Context.Auth -SqlLogin $Context.SqlLogin -SqlPassword $Context.SqlPassword `
+        -TrustServerCertificate ([bool]$Context.TrustServerCertificate)
     try {
         $cmd = $conn.CreateCommand(); $cmd.CommandText = $Query; $cmd.CommandTimeout = $CommandTimeout
         $rd = $cmd.ExecuteReader()
@@ -115,9 +117,10 @@ function Get-ShrinkTestServer {
     <#
     .SYNOPSIS
       Resolve a SQL target for integration tests as a context object
-      { ServerInstance, Auth, SqlLogin, SqlPassword }, or $null if none is reachable.
-      Honors $env:SHRINKDRIVER_TEST_SERVER (+ _AUTH / _LOGIN); for SQL auth the password is prompted
-      for securely at connect time. Otherwise falls back to SQL Server LocalDB with Windows auth.
+      { ServerInstance, Auth, SqlLogin, SqlPassword, TrustServerCertificate }, or $null if none is
+      reachable. Honors $env:SHRINKDRIVER_TEST_SERVER (+ _AUTH / _LOGIN / _TRUSTCERT); for SQL auth the
+      password is prompted for securely at connect time. Otherwise falls back to SQL Server LocalDB with
+      Windows auth.
     #>
     [CmdletBinding()][OutputType([pscustomobject])]
     param()
@@ -125,10 +128,13 @@ function Get-ShrinkTestServer {
     if ($env:SHRINKDRIVER_TEST_SERVER) {
         $auth = if ($env:SHRINKDRIVER_TEST_AUTH) { $env:SHRINKDRIVER_TEST_AUTH } else { 'EntraID' }
         return [pscustomobject]@{
-            ServerInstance = $env:SHRINKDRIVER_TEST_SERVER
-            Auth           = $auth
-            SqlLogin       = $env:SHRINKDRIVER_TEST_LOGIN
-            SqlPassword    = $null   # SQL-auth password is prompted for securely at connect time, never stored as clear text
+            ServerInstance         = $env:SHRINKDRIVER_TEST_SERVER
+            Auth                   = $auth
+            SqlLogin               = $env:SHRINKDRIVER_TEST_LOGIN
+            SqlPassword            = $null   # SQL-auth password is prompted for securely at connect time, never stored as clear text
+            # Trust a self-signed certificate only when explicitly opted in, e.g. a local
+            # dev build.
+            TrustServerCertificate = [bool]($env:SHRINKDRIVER_TEST_TRUSTCERT -in @('1', 'true', 'yes'))
         }
     }
 
@@ -136,7 +142,7 @@ function Get-ShrinkTestServer {
     if (-not $localDbExe) { return $null }
     try {
         & sqllocaldb start MSSQLLocalDB *> $null
-        $ctx = [pscustomobject]@{ ServerInstance = '(localdb)\MSSQLLocalDB'; Auth = 'Windows'; SqlLogin = $null; SqlPassword = $null }
+        $ctx = [pscustomobject]@{ ServerInstance = '(localdb)\MSSQLLocalDB'; Auth = 'Windows'; SqlLogin = $null; SqlPassword = $null; TrustServerCertificate = [bool]($env:SHRINKDRIVER_TEST_TRUSTCERT -in @('1', 'true', 'yes')) }
         Invoke-ShrinkTestSql -Context $ctx -Query 'SELECT 1 AS ok;' -Database master | Out-Null
         return $ctx
     }
@@ -219,6 +225,7 @@ $addedFiles
         Auth           = $Context.Auth
         SqlLogin       = $Context.SqlLogin
         SqlPassword    = $Context.SqlPassword
+        TrustServerCertificate = $Context.TrustServerCertificate
         Database       = $Database
         DataDir        = $DataDir
         Engine         = $engine
@@ -288,7 +295,8 @@ function Open-ShrinkTestBlocker {
     [CmdletBinding()][OutputType([Microsoft.Data.SqlClient.SqlConnection])]
     param([Parameter(Mandatory)][pscustomobject]$TestDb, [string]$TableName = 'dbo.t2')
     $conn = New-ShrinkTestConnection -ServerInstance $TestDb.ServerInstance -Database $TestDb.Database `
-        -Auth $TestDb.Auth -SqlLogin $TestDb.SqlLogin -SqlPassword $TestDb.SqlPassword
+        -Auth $TestDb.Auth -SqlLogin $TestDb.SqlLogin -SqlPassword $TestDb.SqlPassword `
+        -TrustServerCertificate ([bool]$TestDb.TrustServerCertificate)
     $cmd = $conn.CreateCommand()
     $cmd.CommandText = "BEGIN TRAN; SELECT TOP (1) 1 FROM $TableName WITH (TABLOCKX, HOLDLOCK);"
     $cmd.CommandTimeout = 30

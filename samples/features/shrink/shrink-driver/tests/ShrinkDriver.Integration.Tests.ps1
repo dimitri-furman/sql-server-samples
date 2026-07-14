@@ -2,18 +2,20 @@
 <#
   Integration tests for ShrinkDriver. These run real DBCC SHRINKFILE operations against a live SQL
   instance. By default they use SQL Server LocalDB (Windows auth); set $env:SHRINKDRIVER_TEST_SERVER
-  (+ optionally _AUTH = EntraID|Windows|SQL, _LOGIN, _PASSWORD) to target another instance, e.g. an
-  Azure SQL Database logical server. They are skipped automatically when no instance is reachable, so
-  they never break the unit test gate.
+  (+ optionally _AUTH = EntraID|Windows|SQL, _LOGIN, _PASSWORD, and _TRUSTCERT=1 for a self-signed dev
+  instance) to target another instance, e.g. an Azure SQL Database logical server. They are skipped
+  automatically when no instance is reachable, so they never break the unit test gate.
 
   Run:  Invoke-Pester -Path .\tests\ShrinkDriver.Integration.Tests.ps1 -Tag Integration
 
   Notes:
-  - Small files are used so the suite runs quickly; real page-movement shrink is seconds at best, not
-    milliseconds, and DROP-created free space appears only after deferred deallocation settles (handled
+  - Small files are used so the suite runs quickly.
+  - DROP-created free space appears only after deferred deallocation settles (handled
     by Wait-ShrinkFreeSpaceSettled).
-  - Shrinks assert on the returned result object, use -BackoffBaseSeconds/-BackoffCapSeconds 0 for
-    instant retries, and -WaitAtLowPriority:$false (LocalDB Express has no WLP for shrink).
+  - Shrinks assert on the returned result object and use -BackoffBaseSeconds/-BackoffCapSeconds 0
+    for instant retries. Most contexts pass -WaitAtLowPriority:$false so an (optionally blocked)
+    shrink resolves immediately instead of waiting at low priority; WAIT_AT_LOW_PRIORITY itself is
+    exercised by its own context.
 #>
 
 BeforeDiscovery {
@@ -34,6 +36,12 @@ Describe 'ShrinkDriver integration' -Tag 'Integration' -Skip:(-not $server) {
         . (Join-Path $PSScriptRoot '..\src\ShrinkDriver.ps1')
         $server = Get-ShrinkTestServer
         $log = Join-Path ([System.IO.Path]::GetTempPath()) 'shrinkdriver-integration.log'
+        # A dev SQL Server with a self-signed certificate needs its certificate trusted; opt in for such
+        # a target via $env:SHRINKDRIVER_TEST_TRUSTCERT. Instances with a valid or client-trusted
+        # certificate (Azure SQL, LocalDB) are validated normally, so nothing is forced for them.
+        if ($server.TrustServerCertificate) {
+            $PSDefaultParameterValues['Invoke-ShrinkDriver:TrustServerCertificate'] = $true
+        }
     }
 
     Context 'Report mode' {
@@ -85,6 +93,52 @@ Describe 'ShrinkDriver integration' -Tag 'Integration' -Skip:(-not $server) {
         It 'reduces the total allocated size' {
             $allocAfter = (Get-ShrinkTestFileSizes -TestDb $db | Measure-Object -Property alloc_mb -Sum).Sum
             $allocAfter | Should -BeLessThan $allocBefore
+        }
+    }
+
+    Context 'WAIT_AT_LOW_PRIORITY (low-priority lock)' {
+        # These runs are uncontended, so the low-priority lock is granted at once and the driver's emitted
+        # WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = ...) clause is exercised end-to-end for both
+        # abort choices.
+        BeforeAll {
+            $known = @('Shrunk', 'PartlyShrunk', 'AlreadyMinimal', 'AlreadyAtTarget', 'Repacked', 'Grew', 'GaveUp', 'Interrupted', 'NotProcessed')
+
+            $dbSelf = New-ShrinkTestDatabase -Context $server
+            Wait-ShrinkFreeSpaceSettled -TestDb $dbSelf -MinFreeMB 8 | Out-Null
+            $allocBeforeSelf = (Get-ShrinkTestFileSizes -TestDb $dbSelf | Measure-Object -Property alloc_mb -Sum).Sum
+            $resSelf = Invoke-ShrinkDriver -ServerName $server.ServerInstance -DatabaseName $dbSelf.Database -Mode Shrink `
+                -AuthType $server.Auth -WaitAtLowPriority:$true -AbortAfterWait SELF -BackoffBaseSeconds 0 -BackoffCapSeconds 0 `
+                -MinReclaimMBOverride 1 -StepMBOverride 20 -Sessions 4 -StatusIntervalSeconds 5 -PassThru -LogPath $log 6>$null
+            $allocAfterSelf = (Get-ShrinkTestFileSizes -TestDb $dbSelf | Measure-Object -Property alloc_mb -Sum).Sum
+
+            $dbBlockers = New-ShrinkTestDatabase -Context $server
+            Wait-ShrinkFreeSpaceSettled -TestDb $dbBlockers -MinFreeMB 8 | Out-Null
+            $allocBeforeBlockers = (Get-ShrinkTestFileSizes -TestDb $dbBlockers | Measure-Object -Property alloc_mb -Sum).Sum
+            $resBlockers = Invoke-ShrinkDriver -ServerName $server.ServerInstance -DatabaseName $dbBlockers.Database -Mode Shrink `
+                -AuthType $server.Auth -WaitAtLowPriority:$true -AbortAfterWait BLOCKERS -BackoffBaseSeconds 0 -BackoffCapSeconds 0 `
+                -MinReclaimMBOverride 1 -StepMBOverride 20 -Sessions 4 -StatusIntervalSeconds 5 -PassThru -LogPath $log 6>$null
+            $allocAfterBlockers = (Get-ShrinkTestFileSizes -TestDb $dbBlockers | Measure-Object -Property alloc_mb -Sum).Sum
+        }
+        AfterAll {
+            Remove-ShrinkTestDatabase -TestDb $dbSelf
+            Remove-ShrinkTestDatabase -TestDb $dbBlockers
+        }
+
+        It 'reclaims space with ABORT_AFTER_WAIT = SELF' {
+            ($resSelf.Counts.Shrunk + $resSelf.Counts.PartlyShrunk) | Should -BeGreaterThan 0
+            $allocAfterSelf | Should -BeLessThan $allocBeforeSelf
+        }
+
+        It 'reclaims space with ABORT_AFTER_WAIT = BLOCKERS' {
+            ($resBlockers.Counts.Shrunk + $resBlockers.Counts.PartlyShrunk) | Should -BeGreaterThan 0
+            $allocAfterBlockers | Should -BeLessThan $allocBeforeBlockers
+        }
+
+        It 'classifies every file into a known bucket under low-priority waits' {
+            $resSelf.Files.Count | Should -BeGreaterThan 0
+            $resBlockers.Files.Count | Should -BeGreaterThan 0
+            foreach ($f in $resSelf.Files) { $f.Bucket | Should -BeIn $known }
+            foreach ($f in $resBlockers.Files) { $f.Bucket | Should -BeIn $known }
         }
     }
 
