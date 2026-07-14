@@ -42,6 +42,9 @@ Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -Mode Shrink -AuthType 
 
 # Shrink with SQL auth (prompts securely for the password when it is not supplied)
 Invoke-ShrinkDriver -ServerName sql01 -DatabaseName MyDb -Mode Shrink -AuthType SQL -SqlLogin appuser
+
+# Connect to an instance with a self-signed certificate
+Invoke-ShrinkDriver -ServerName devsql01 -DatabaseName MyDb -Mode Shrink -AuthType Windows -TrustServerCertificate
 ```
 
 For the full list of parameters and what they do:
