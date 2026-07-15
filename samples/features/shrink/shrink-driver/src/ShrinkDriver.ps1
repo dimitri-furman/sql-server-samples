@@ -1,4 +1,16 @@
-#Requires -Version 7.0
+<#PSScriptInfo
+.VERSION 1.0.0
+.GUID 1b801c08-f374-45df-ba3e-34d9983e9133
+.AUTHOR Microsoft
+.COMPANYNAME Microsoft
+.COPYRIGHT (c) Microsoft Corporation. Licensed under the MIT License.
+.TAGS SQL SQLServer AzureSQL DBCC SHRINKFILE shrink maintenance
+.LICENSEURI https://github.com/microsoft/sql-server-samples/blob/master/license.txt
+.PROJECTURI https://github.com/microsoft/sql-server-samples
+.RELEASENOTES
+Initial version.
+#>
+
 <#
 .SYNOPSIS
   Loads Invoke-ShrinkDriver, a command that reclaims allocated but unused space from
@@ -16,6 +28,8 @@
 
   Run 'Get-Help Invoke-ShrinkDriver -Full' for the description, parameters, and examples.
 #>
+
+#Requires -Version 7.0
 
 Set-StrictMode -Version Latest
 
@@ -186,7 +200,7 @@ function Invoke-ShrinkDriver {
     $useColor = [string]::IsNullOrEmpty($env:NO_COLOR)
     function Write-ShrinkLog {
         param([string]$Message, [string]$Level = 'INFO')
-        $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
         $line = '{0} [{1}] {2}' -f $stamp, $Level, $Message
         [System.Threading.Monitor]::Enter($logLock)
         try {
@@ -200,9 +214,9 @@ function Invoke-ShrinkDriver {
                     'ERROR' { 'Red' }
                     'WARN' { 'Yellow' }
                     default {
-                        if ($Message -match '^-{3,}') { 'Cyan' }                                          # section dividers/headers
-                        elseif ($Message -match '(Grew|Gave up|Partly shrunk)\s*:\s*[1-9]') { 'Yellow' }  # non-zero problem outcomes
-                        elseif ($Message -match '(Shrunk|Repacked)\s*:\s*[1-9]') { 'Green' }               # non-zero successful outcomes
+                        if ($Message -match '^-{3,}') { 'Cyan' } # section dividers/headers
+                        elseif ($Message -match '(Grew|Gave up|Partly shrunk)\s*:\s*[1-9]') { 'Yellow' } # non-zero problem outcomes
+                        elseif ($Message -match '(Shrunk|Repacked)\s*:\s*[1-9]') { 'Green' } # non-zero successful outcomes
                         else { $null }
                     }
                 }
@@ -472,6 +486,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
             DbUsedMB      = $usedSum
             DbAllocatedMB = $allocSum
             Counts        = (Get-ShrinkBucketCounts -Buckets @())
+            EligibleRemaining = 0
             Files         = @()
         }
     }
@@ -562,7 +577,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
                     # shown separately in the database-total section.
                     $shared.Sessions[$workerId].Spid = $newSpid
                     $shared.Sessions[$workerId].State = 'Shrinking'
-                    $shared.Sessions[$workerId].ConnectTime = (Get-Date)
+                    $shared.Sessions[$workerId].ConnectTime = [System.Diagnostics.Stopwatch]::GetTimestamp()
                     Emit "reconnected on attempt $try (session ID $newSpid)"
                     return $newConn
                 }
@@ -578,7 +593,7 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
         $conn = New-WConn
         $spidCmd = $conn.CreateCommand(); $spidCmd.CommandText = 'SELECT @@SPID'
         $spid = [int]$spidCmd.ExecuteScalar(); $spidCmd.Dispose()
-        $shared.Sessions[$workerId] = @{ Spid = $spid; Command = $null; FileId = $null; State = 'Idle'; ConnectTime = (Get-Date); RequestSeq = 0 }
+        $shared.Sessions[$workerId] = @{ Spid = $spid; Command = $null; FileId = $null; State = 'Idle'; ConnectTime = [System.Diagnostics.Stopwatch]::GetTimestamp(); RequestSeq = 0 }
         Emit "Connected (session ID $spid)"
 
         try {
@@ -862,8 +877,11 @@ SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     }
 
     # ----- monitor loop -----
-    $startTime = Get-Date
-    $deadline = if ($null -ne $MaxRuntimeSecondsOverride) { $startTime.AddSeconds([int]$MaxRuntimeSecondsOverride) } elseif ($null -ne $MaxRuntimeMinutes) { $startTime.AddMinutes([int]$MaxRuntimeMinutes) } else { $null }
+    # Drive all run-time and interval math from a monotonic clock so a wall-clock change mid-run (a
+    # DST transition or an NTP/manual adjustment) cannot make the run-time limit fire early or late,
+    # or yield a negative elapsed.
+    $runClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $limitSeconds = if ($null -ne $MaxRuntimeSecondsOverride) { [double]$MaxRuntimeSecondsOverride } elseif ($null -ne $MaxRuntimeMinutes) { [double]$MaxRuntimeMinutes * 60 } else { $null }
     $prev = @{}; $stuckState = @{}
 
     function Write-StatusReport {
@@ -901,9 +919,10 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         foreach ($sess in $shared.Sessions.GetEnumerator() | Sort-Object { $_.Key }) {
             $workerId = $sess.Key; $s = $sess.Value
             $seq = [int]$s.RequestSeq
-            # Elapsed is the worker's wall-clock time on its current connection (it resets when the
-            # worker reconnects). The run-wide elapsed since script start is in the database-total section.
-            $sessElapsedS = if ($s.ConnectTime) { [int]((Get-Date) - [datetime]$s.ConnectTime).TotalSeconds } else { $null }
+            # Elapsed is the worker's time on its current connection (it resets when the worker
+            # reconnects). ConnectTime is a monotonic timestamp; the run-wide elapsed since script
+            # start is in the database-total section.
+            $sessElapsedS = if ($s.ConnectTime) { [int](([System.Diagnostics.Stopwatch]::GetTimestamp() - [long]$s.ConnectTime) / [System.Diagnostics.Stopwatch]::Frequency) } else { $null }
             $row = $rows | Where-Object Spid -eq $s.Spid | Select-Object -First 1
             if (-not $row) {
                 $statusData.Add([pscustomobject]@{
@@ -937,7 +956,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 })
 
             if (-not $stuckState.ContainsKey($s.Spid)) { $stuckState[$s.Spid] = @{ Blocker = 0; Cpu = 0; Reads = 0; BlockerSince = $null; NoProgressSince = $null } }
-            $st = Update-ShrinkStuckState -State $stuckState[$s.Spid] -Blocker $row.Blocker -Cpu $row.Cpu -Reads $row.Reads -Now (Get-Date) -WindowSec $StuckWindowSeconds
+            $st = Update-ShrinkStuckState -State $stuckState[$s.Spid] -Blocker $row.Blocker -Cpu $row.Cpu -Reads $row.Reads -NowSeconds $runClock.Elapsed.TotalSeconds -WindowSec $StuckWindowSeconds
             if ($st.IsStuck -and $s.Command) {
                 $why = if ($st.BlockerStuck -and $row.Blocker) { "blocked by session $($row.Blocker)" } else { 'no CPU or read progress' }
                 Write-ShrinkLog ("worker {0} session ID {1} stuck ({2}) for >= {3}s: cancelling command." -f $workerId, $s.Spid, $why, $StuckWindowSeconds) 'WARN'
@@ -981,7 +1000,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         $c = Get-ShrinkBucketCounts -Buckets $buckets
         Write-ShrinkLog '---- database total ----'
         Format-ShrinkKeyValueTable -Rows (Get-ShrinkTotalsRows `
-                -RunTime (Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime)) `
+                -RunTime (Format-ShrinkDuration -TimeSpan $runClock.Elapsed) `
                 -Used (Format-ShrinkSize $dbUsedMb) -Allocated (Format-ShrinkSize $dbAllocMb) -Counts $c) |
             ForEach-Object { Write-ShrinkLog $_ }
     }
@@ -990,7 +1009,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
     # promptly, but run the heavier per-file status report only every StatusIntervalSeconds
     # (with the first one shortly after startup so progress shows without a long initial wait).
     $pollSeconds = [Math]::Max(1, [Math]::Min(2, $StatusIntervalSeconds))
-    $nextReport = (Get-Date).AddSeconds([Math]::Min(15, $StatusIntervalSeconds))
+    $nextReportAtS = [double][Math]::Min(15, $StatusIntervalSeconds)
     try {
         while ($true) {
             $evt = ''
@@ -1017,7 +1036,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                     }
                 }
             }
-            if ((Get-Date) -ge $nextReport) {
+            if ($runClock.Elapsed.TotalSeconds -ge $nextReportAtS) {
                 # The status report reads through the control connection; if the server dropped it
                 # (e.g. a restart), reopen it and skip just this report rather than failing the run.
                 try {
@@ -1028,10 +1047,10 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                     Write-ShrinkLog ("Status report skipped (control connection issue): {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN'
                     try { $control = Get-ShrinkLiveControl $control } catch { Write-ShrinkLog ("Control reconnect failed; will retry at the next report: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
                 }
-                $nextReport = (Get-Date).AddSeconds($StatusIntervalSeconds)
+                $nextReportAtS = $runClock.Elapsed.TotalSeconds + $StatusIntervalSeconds
             }
             if (-not ($workers | Where-Object { -not $_.Handle.IsCompleted })) { Write-ShrinkLog 'All workers finished.'; break }
-            if ($deadline -and (Get-Date) -ge $deadline -and -not $shared.Stop) {
+            if ($null -ne $limitSeconds -and $runClock.Elapsed.TotalSeconds -ge $limitSeconds -and -not $shared.Stop) {
                 Write-ShrinkLog 'Run time limit reached: stopping and recording each in-flight file''s current state.' 'WARN'
                 $shared.StopReason = 'Timeout'
                 $shared.Stop = $true
@@ -1049,14 +1068,20 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
         # Flush any worker events that arrived after the last poll, then write a single final summary.
         $evt = ''
         while ($shared.Events.TryDequeue([ref]$evt)) { Write-ShrinkLog $evt 'EVENT' }
-        $elapsed = Format-ShrinkDuration -TimeSpan ((Get-Date) - $startTime)
+        $elapsed = Format-ShrinkDuration -TimeSpan $runClock.Elapsed
         # The final totals need a live control connection; if the server dropped it (e.g. a restart),
         # try once to reopen, but never let that stop us from writing the outcome summary.
         $dbUsedMb = $null; $dbAllocMb = $null
+        # After shrinking, re-check which data files still have at least MinReclaimMB of reclaimable
+        # space. A file may have been shrunk only partly or skipped for reasons that are often transient
+        # (it grew while being shrunk, or was blocked), and files can also become eligible during a long
+        # run; in either case a later run can frequently reclaim more. This is advisory only.
+        $remainingEligible = @()
         try {
             $control = Get-ShrinkLiveControl $control
             $tot = Get-ShrinkDatabaseTotals -Conn $control
             $dbUsedMb = $tot.Used; $dbAllocMb = $tot.Alloc
+            $remainingEligible = @(Get-EligibleFiles -Conn $control | Where-Object { Test-ShrinkWorthwhile -AllocatedMB $_.AllocatedMB -UsedMB $_.UsedMB -FloorMB $floorMB -MinReclaimMB $minReclaimMB })
         } catch { Write-ShrinkLog ("Could not read final database totals: {0}" -f $_.Exception.Message.Split([Environment]::NewLine)[0]) 'WARN' }
         # Reconcile: any eligible file that never reached a terminal state (e.g. left unprocessed after
         # an unrecoverable outage, or never started) is recorded as NotProcessed, so the summary reflects
@@ -1076,6 +1101,11 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
                 -Allocated $(if ($null -ne $dbAllocMb) { Format-ShrinkSize $dbAllocMb } else { '(unavailable)' }) -Counts $c) |
             ForEach-Object { Write-ShrinkLog $_ }
         foreach ($r in $shared.Completed.GetEnumerator() | Sort-Object { [int]$_.Key }) { if ($r.Value.Reason) { Write-ShrinkLog ("  file {0} [{1}]: {2}" -f $r.Key, $r.Value.Bucket, $r.Value.Reason) } }
+        if ($remainingEligible.Count -gt 0) {
+            $reclRemainMb = [long]0
+            foreach ($f in $remainingEligible) { $reclRemainMb += (Get-ShrinkReclaimableMB -AllocatedMB $f.AllocatedMB -UsedMB $f.UsedMB -FloorMB $floorMB) }
+            Write-ShrinkLog ("{0} data file(s) still have reclaimable space ({1} total). A partial or skipped shrink can be due to transient conditions (such as concurrent growth or blocking), so running shrink again might reclaim more." -f $remainingEligible.Count, (Format-ShrinkSize $reclRemainMb))
+        }
         Write-ShrinkLog '-------------------------------------------------'
         # Structured result for programmatic callers / tests (the log/console is unchanged).
         $runResult = [pscustomobject]@{
@@ -1085,6 +1115,7 @@ FROM sys.dm_exec_requests r WHERE r.session_id IN ($inList);
             DbUsedMB      = $dbUsedMb
             DbAllocatedMB = $dbAllocMb
             Counts        = $c
+            EligibleRemaining = $remainingEligible.Count
             Files         = @($shared.Completed.GetEnumerator() | Sort-Object { [int]$_.Key } | ForEach-Object { [pscustomobject]@{ FileId = [int]$_.Key; Bucket = $_.Value.Bucket; Reason = $_.Value.Reason } })
         }
         try { $control.Close() } catch {}
@@ -1562,25 +1593,27 @@ function Update-ShrinkStuckState {
         [int]$Blocker = 0,
         [long]$Cpu = 0,
         [long]$Reads = 0,
-        [datetime]$Now = (Get-Date),
+        [double]$NowSeconds = ([System.Diagnostics.Stopwatch]::GetTimestamp() / [double][System.Diagnostics.Stopwatch]::Frequency),
         [int]$WindowSec = 300
     )
+    # $NowSeconds is a monotonic seconds value (e.g. the run stopwatch's elapsed seconds), not wall
+    # clock, so the elapsed-time comparisons below are immune to a clock change mid-run.
     # Blocker streak: how long the same non-zero blocking session has persisted. Cleared when there is
     # no blocker; restarted when the blocking session changes.
     if (-not $Blocker) {
         $State.BlockerSince = $null
     }
     elseif ($State.Blocker -ne $Blocker -or $null -eq $State.BlockerSince) {
-        $State.BlockerSince = $Now
+        $State.BlockerSince = $NowSeconds
     }
     # No-progress streak: how long neither CPU nor reads have changed. Any change - including a
     # per-request counter reset, which signals a new step - counts as progress and restarts the streak.
     if ($State.Cpu -ne $Cpu -or $State.Reads -ne $Reads -or $null -eq $State.NoProgressSince) {
-        $State.NoProgressSince = $Now
+        $State.NoProgressSince = $NowSeconds
     }
 
-    $blockerStuck = ($null -ne $State.BlockerSince) -and (($Now - [datetime]$State.BlockerSince).TotalSeconds -ge $WindowSec)
-    $noProgressStuck = ($null -ne $State.NoProgressSince) -and (($Now - [datetime]$State.NoProgressSince).TotalSeconds -ge $WindowSec)
+    $blockerStuck = ($null -ne $State.BlockerSince) -and (($NowSeconds - [double]$State.BlockerSince) -ge $WindowSec)
+    $noProgressStuck = ($null -ne $State.NoProgressSince) -and (($NowSeconds - [double]$State.NoProgressSince) -ge $WindowSec)
     $isStuck = [bool]($blockerStuck -or $noProgressStuck)
 
     $State.Blocker = $Blocker

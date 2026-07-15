@@ -254,6 +254,12 @@ Describe 'ShrinkDriver integration' -Tag 'Integration' -Skip:(-not $server) {
             $res.Files.Count | Should -BeGreaterThan 0
             ($res.Counts.Interrupted + $res.Counts.PartlyShrunk + $res.Counts.NotProcessed) | Should -BeGreaterThan 0
         }
+
+        It 'reports data files that still have reclaimable space to reclaim on a re-run' {
+            # The blocked and unprocessed files were not fully shrunk, so an end-of-run re-check finds
+            # space still reclaimable and reports it for a follow-up run.
+            $res.EligibleRemaining | Should -BeGreaterThan 0
+        }
     }
 
     Context 'Worker reconnect after a dropped connection' -Skip:(-not $isBoxEngine) {
@@ -273,7 +279,7 @@ Describe 'ShrinkDriver integration' -Tag 'Integration' -Skip:(-not $server) {
                 while ((Get-Date) -lt $deadline -and $kills -lt 2) {
                     try {
                         $r = Invoke-Sqlcmd -ServerInstance $serverInstance -Database $database -TrustServerCertificate -ErrorAction Stop `
-                            -Query "SELECT TOP (1) session_id AS spid FROM sys.dm_exec_sessions WHERE program_name LIKE 'ShrinkDriver-w%'"
+                            -Query "SELECT TOP (1) session_id AS spid FROM sys.dm_exec_sessions WHERE program_name LIKE 'ShrinkDriver-w%' AND database_id = DB_ID()"
                         if ($r -and $null -ne $r.spid) {
                             Invoke-Sqlcmd -ServerInstance $serverInstance -Database $database -TrustServerCertificate -ErrorAction Stop -Query "KILL $($r.spid)"
                             $kills++
